@@ -213,6 +213,36 @@ class Database:
             cur = c.execute("DELETE FROM notes WHERE note_id=? AND user_id=?", (note_id, user_id))
             return cur.rowcount > 0
 
+    def update_note_title(self, note_id: int, user_id: int, new_title: str) -> bool:
+        """Меняет title заметки и одновременно поле title в summary_json."""
+        note = self.get_note(note_id, user_id)
+        if note is None:
+            return False
+        new_summary = dict(note.summary)
+        new_summary["title"] = new_title
+        with self._tx() as c:
+            cur = c.execute(
+                "UPDATE notes SET title=?, summary_json=? WHERE note_id=? AND user_id=?",
+                (new_title, json.dumps(new_summary, ensure_ascii=False), note_id, user_id),
+            )
+            return cur.rowcount > 0
+
+    def update_note_summary_field(
+        self, note_id: int, user_id: int, field: str, value
+    ) -> bool:
+        """Обновляет произвольное поле в summary_json (category/tags/...)."""
+        note = self.get_note(note_id, user_id)
+        if note is None:
+            return False
+        new_summary = dict(note.summary)
+        new_summary[field] = value
+        with self._tx() as c:
+            cur = c.execute(
+                "UPDATE notes SET summary_json=? WHERE note_id=? AND user_id=?",
+                (json.dumps(new_summary, ensure_ascii=False), note_id, user_id),
+            )
+            return cur.rowcount > 0
+
     def delete_all(self, user_id: int) -> int:
         with self._tx() as c:
             cur = c.execute("DELETE FROM notes WHERE user_id=?", (user_id,))
@@ -292,6 +322,22 @@ class Database:
             cur = c.execute(
                 "UPDATE reminders SET status='cancelled' WHERE reminder_id=? AND user_id=? AND status='pending'",
                 (reminder_id, user_id),
+            )
+            return cur.rowcount > 0
+
+    def update_reminder_text(self, reminder_id: int, user_id: int, new_text: str) -> bool:
+        with self._tx() as c:
+            cur = c.execute(
+                "UPDATE reminders SET text=? WHERE reminder_id=? AND user_id=? AND status='pending'",
+                (new_text, reminder_id, user_id),
+            )
+            return cur.rowcount > 0
+
+    def update_reminder_fire_at(self, reminder_id: int, user_id: int, new_fire_at: int) -> bool:
+        with self._tx() as c:
+            cur = c.execute(
+                "UPDATE reminders SET fire_at=? WHERE reminder_id=? AND user_id=? AND status='pending'",
+                (new_fire_at, reminder_id, user_id),
             )
             return cur.rowcount > 0
 

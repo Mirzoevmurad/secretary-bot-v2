@@ -9,11 +9,12 @@ import tempfile
 import time
 from pathlib import Path
 
-from telegram import Update
+from telegram import BotCommand, ForceReply, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     Defaults,
@@ -27,10 +28,12 @@ from llm import GroqLLM, LLMError, Summary
 from reminders import (
     materialize_reminders,
     now_context_block,
+    parse_iso_to_epoch,
     reminders_to_ical,
 )
 from stt import GroqSTT, STTError
 import formatter as fmt
+import keyboards as kb
 
 
 try:
@@ -128,24 +131,28 @@ def _has_unsafe_chunk(chunks: list[str], limit: int = 3900) -> bool:
     return any(len(c) > limit for c in chunks)
 
 
-async def _reply_long_html(msg, text: str, limit: int = 3900) -> None:
+async def _reply_long_html(msg, text: str, limit: int = 3900, reply_markup=None) -> None:
     """Отправляет длинный HTML-текст одним или несколькими сообщениями.
 
-    Если все куски в безопасных границах — шлём с parse_mode=HTML.
-    Если нашёлся атомарный кусок > limit (крайне маловероятно) — режем посимвольно
-    и шлём как plain text, чтобы Telegram не отверг разорванный тэг.
+    `reply_markup` (если задан) прикрепляется к ПОСЛЕДНЕМУ сообщению — иначе
+    Telegram не позволит «разделить» клавиатуру между кусками.
     """
     chunks = _split_for_telegram(text, limit=limit)
     safe = not _has_unsafe_chunk(chunks, limit)
     if safe:
-        for chunk in chunks:
-            await msg.reply_html(chunk, disable_web_page_preview=True)
+        for i, chunk in enumerate(chunks):
+            kw = {"disable_web_page_preview": True}
+            if i == len(chunks) - 1 and reply_markup is not None:
+                kw["reply_markup"] = reply_markup
+            await msg.reply_html(chunk, **kw)
         return
-    # fallback: режем посимвольно и шлём как plain text. parse_mode=None обязателен —
-    # Application имеет Defaults(parse_mode=ParseMode.HTML), без явного None Telegram
-    # будет интерпретировать порванный тэг как HTML и отвергнет сообщение.
-    for i in range(0, len(text), limit):
-        await msg.reply_text(text[i:i + limit], parse_mode=None, disable_web_page_preview=True)
+    # fallback: режем посимвольно и шлём как plain text. parse_mode=None обязателен.
+    pieces = [text[i:i + limit] for i in range(0, len(text), limit)]
+    for i, piece in enumerate(pieces):
+        kw = {"parse_mode": None, "disable_web_page_preview": True}
+        if i == len(pieces) - 1 and reply_markup is not None:
+            kw["reply_markup"] = reply_markup
+        await msg.reply_text(piece, **kw)
 
 
 def _convert_to_wav(src: Path, dst: Path) -> None:
@@ -189,7 +196,11 @@ async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if note is None:
         await update.effective_message.reply_text("Заметок пока нет.")
         return
-    await _reply_long_html(update.effective_message, fmt.format_note(note, tz_name=cfg.tz))
+    await _reply_long_html(
+        update.effective_message,
+        fmt.format_note(note, tz_name=cfg.tz),
+        reply_markup=kb.note_actions_kb(note.note_id),
+    )
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -202,7 +213,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         limit = min(int(args[0]), 50)
     db: Database = context.bot_data["db"]
     notes = db.list_notes(update.effective_user.id, limit=limit)
-    await update.effective_message.reply_html(fmt.format_list(notes))
+    markup = kb.note_list_kb([n.note_id for n in notes]) if notes else None
+    await update.effective_message.reply_html(fmt.format_list(notes), reply_markup=markup)
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -258,8 +270,11 @@ async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     cfg: Config = context.bot_data["cfg"]
     db: Database = context.bot_data["db"]
     items = db.list_pending_reminders(update.effective_user.id)
+    markup = kb.reminders_list_kb([r.reminder_id for r in items]) if items else None
     await _reply_long_html(
-        update.effective_message, fmt.format_reminders_list(items, cfg.tz)
+        update.effective_message,
+        fmt.format_reminders_list(items, cfg.tz),
+        reply_markup=markup,
     )
 
 
@@ -312,6 +327,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     db: Database = context.bot_data["db"]
 
+    # Если ждём ответ на edit-запрос — обработать первым делом, до /-команд и LLM.
+    pending = context.user_data.get("pending_edit") if context.user_data is not None else None
+    if pending and update.effective_message.reply_to_message:
+        if update.effective_message.reply_to_message.message_id == pending.get("prompt_id"):
+            await _apply_pending_edit(update, context, pending, txt)
+            return
+
     m = _GET_RE.match(txt)
     if m:
         note_id = int(m.group(1))
@@ -319,7 +341,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if note is None:
             await update.effective_message.reply_text(f"Заметка #{note_id} не найдена.")
             return
-        await _reply_long_html(update.effective_message, fmt.format_transcript(note))
+        await _reply_long_html(
+            update.effective_message,
+            fmt.format_transcript(note),
+            reply_markup=kb.note_actions_kb(note.note_id),
+        )
         return
     m = _DELETE_RE.match(txt)
     if m:
@@ -370,6 +396,246 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         source="text",
         audio_path_saved=None,
     )
+
+
+# ---- inline-button callbacks + edit flow ------------------------------
+
+
+_FIELD_PROMPTS = {
+    "title": "Пришлите новый заголовок для заметки",
+    "cat": "Пришлите новую категорию (например: Работа, Личное, Идея, Покупки)",
+    "tags": "Пришлите теги через пробел или запятую (например: проект, дедлайн)",
+    "rtext": "Пришлите новый текст напоминания",
+    "rtime": (
+        "Пришлите новое время напоминания. Можно:\n"
+        "• ISO: 2026-04-26 14:30 (в TZ Europe/Moscow)\n"
+        "• Свободно: «завтра в 12:30», «через 2 часа», «в пятницу в 9»"
+    ),
+}
+
+
+async def _ask_for_edit(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    kind: str,
+    item_id: int,
+    field: str,
+) -> None:
+    prompt_text = _FIELD_PROMPTS.get(field, "Пришлите новое значение")
+    prompt = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"✏️ {prompt_text}\n\n<i>(ответьте на это сообщение — ИЛИ пришлите следующим сообщением)</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ForceReply(selective=True, input_field_placeholder="новое значение…"),
+    )
+    if context.user_data is None:
+        return
+    context.user_data["pending_edit"] = {
+        "kind": kind,
+        "id": item_id,
+        "field": field,
+        "prompt_id": prompt.message_id,
+    }
+
+
+async def _apply_pending_edit(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    pending: dict,
+    new_value: str,
+) -> None:
+    """Применяет pending edit (заметка/напоминание × поле). Снимает pending в любом случае."""
+    db: Database = context.bot_data["db"]
+    cfg: Config = context.bot_data["cfg"]
+    user_id = update.effective_user.id
+    kind, item_id, field = pending["kind"], int(pending["id"]), pending["field"]
+    new_value = new_value.strip()
+    # Очищаем pending до возможного fail — иначе застрянем.
+    if context.user_data is not None:
+        context.user_data.pop("pending_edit", None)
+
+    if not new_value:
+        await update.effective_message.reply_text("Пустое значение, отмена.")
+        return
+
+    if kind == "note":
+        if field == "title":
+            ok = db.update_note_title(item_id, user_id, new_value[:200])
+            await update.effective_message.reply_text(
+                f"✅ Заголовок заметки #{item_id} обновлён." if ok else f"Заметка #{item_id} не найдена."
+            )
+        elif field == "cat":
+            ok = db.update_note_summary_field(item_id, user_id, "category", new_value[:50])
+            await update.effective_message.reply_text(
+                f"✅ Категория заметки #{item_id} обновлена." if ok else f"Заметка #{item_id} не найдена."
+            )
+        elif field == "tags":
+            tags = [t.strip() for t in re.split(r"[,\s]+", new_value) if t.strip()][:20]
+            ok = db.update_note_summary_field(item_id, user_id, "tags", tags)
+            await update.effective_message.reply_text(
+                f"✅ Теги заметки #{item_id}: {', '.join(tags) or '—'}" if ok else f"Заметка #{item_id} не найдена."
+            )
+        else:
+            await update.effective_message.reply_text("Неизвестное поле.")
+        return
+
+    if kind == "rem":
+        rem = db.get_reminder(item_id, user_id)
+        if rem is None:
+            await update.effective_message.reply_text(f"Напоминание #{item_id} не найдено.")
+            return
+        if rem.status != "pending":
+            await update.effective_message.reply_text(
+                f"Напоминание #{item_id} уже {rem.status}, его нельзя менять."
+            )
+            return
+        if field == "rtext":
+            ok = db.update_reminder_text(item_id, user_id, new_value[:200])
+            await update.effective_message.reply_text(
+                f"✅ Текст напоминания #{item_id} обновлён." if ok else "Не удалось обновить."
+            )
+        elif field == "rtime":
+            new_epoch = await _parse_new_fire_at(context, new_value, cfg.tz)
+            if new_epoch is None:
+                await update.effective_message.reply_text(
+                    "Не понял дату/время. Попробуйте «завтра в 14:30» или «через 1 час»."
+                )
+                return
+            now = int(time.time())
+            if new_epoch <= now:
+                await update.effective_message.reply_text("Время в прошлом. Отмена.")
+                return
+            ok = db.update_reminder_fire_at(item_id, user_id, new_epoch)
+            if not ok:
+                await update.effective_message.reply_text("Не удалось обновить.")
+                return
+            # перепланировать jobs
+            _cancel_reminder_jobs(context.application, item_id)
+            updated = db.get_reminder(item_id, user_id)
+            if updated is not None:
+                _schedule_reminder(context.application, updated)
+                await update.effective_message.reply_text(
+                    f"✅ Напоминание #{item_id} перенесено на {fmt.fmt_fire_at(new_epoch, cfg.tz)}."
+                )
+        return
+
+
+async def _parse_new_fire_at(
+    context: ContextTypes.DEFAULT_TYPE,
+    raw: str,
+    tz_name: str,
+) -> int | None:
+    """Сначала пытаемся ISO-парсер, если не вышло — отправляем строку в LLM ReminderSpec."""
+    epoch = parse_iso_to_epoch(raw, tz_name)
+    if epoch is not None:
+        return epoch
+    llm: GroqLLM = context.bot_data["llm"]
+    try:
+        summary = await llm.structure(
+            f"Создай напоминание: {raw}",
+            now_context=now_context_block(tz_name),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("LLM failed to parse new fire_at")
+        return None
+    if not summary.reminders:
+        return None
+    return parse_iso_to_epoch(summary.reminders[0].fire_at_iso, tz_name)
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if q is None or q.data is None:
+        return
+    user_id = update.effective_user.id
+    if not _is_allowed(context, user_id):
+        await q.answer("Доступ запрещён.", show_alert=True)
+        return
+    db: Database = context.bot_data["db"]
+    cfg: Config = context.bot_data["cfg"]
+    data = q.data
+
+    if data == "nop":
+        await q.answer("Отмена.")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    parts = data.split(":")
+    # n:e:title:42 / n:e:cat:42 / n:e:tags:42
+    if parts[0] == "n" and parts[1] == "e" and len(parts) == 4:
+        await q.answer()
+        await _ask_for_edit(context, q.message.chat_id, "note", int(parts[3]), parts[2])
+        return
+    # n:open:42
+    if parts[0] == "n" and parts[1] == "open" and len(parts) == 3:
+        note_id = int(parts[2])
+        note = db.get_note(note_id, user_id)
+        if note is None:
+            await q.answer("Заметка не найдена.", show_alert=True)
+            return
+        await q.answer()
+        await _reply_long_html(
+            q.message,
+            fmt.format_note(note, tz_name=cfg.tz),
+            reply_markup=kb.note_actions_kb(note.note_id),
+        )
+        return
+    # n:del:42 → подтверждение
+    if parts[0] == "n" and parts[1] == "del" and len(parts) == 3:
+        await q.answer()
+        await context.bot.send_message(
+            chat_id=q.message.chat_id,
+            text=f"🗑 Удалить заметку #{parts[2]}?",
+            reply_markup=kb.confirm_delete_note_kb(int(parts[2])),
+        )
+        return
+    # n:del_yes:42
+    if parts[0] == "n" and parts[1] == "del_yes" and len(parts) == 3:
+        note_id = int(parts[2])
+        ok = db.delete_note(note_id, user_id)
+        await q.answer("Удалено." if ok else "Не найдено.")
+        try:
+            await q.edit_message_text(
+                f"🗑 Заметка #{note_id} удалена." if ok else f"Заметка #{note_id} не найдена.",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    # r:e:time:5 / r:e:text:5
+    if parts[0] == "r" and parts[1] == "e" and len(parts) == 4:
+        await q.answer()
+        field_map = {"time": "rtime", "text": "rtext"}
+        field = field_map.get(parts[2], parts[2])
+        await _ask_for_edit(context, q.message.chat_id, "rem", int(parts[3]), field)
+        return
+    # r:cancel:5 → подтверждение
+    if parts[0] == "r" and parts[1] == "cancel" and len(parts) == 3:
+        await q.answer()
+        await context.bot.send_message(
+            chat_id=q.message.chat_id,
+            text=f"🗑 Отменить напоминание #{parts[2]}?",
+            reply_markup=kb.confirm_cancel_reminder_kb(int(parts[2])),
+        )
+        return
+    # r:cancel_yes:5
+    if parts[0] == "r" and parts[1] == "cancel_yes" and len(parts) == 3:
+        rid = int(parts[2])
+        ok = db.cancel_reminder(rid, user_id)
+        if ok:
+            _cancel_reminder_jobs(context.application, rid)
+        await q.answer("Отменено." if ok else "Не найдено.")
+        try:
+            await q.edit_message_text(
+                f"🗑 Напоминание #{rid} отменено." if ok else f"Напоминание #{rid} не найдено или уже отменено.",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    await q.answer("Неизвестное действие.")
 
 
 # ---- main voice handler -----------------------------------------------
@@ -526,28 +792,40 @@ async def _process_summary(
     text = fmt.format_note(note, tz_name=cfg.tz, scheduled_reminders=scheduled)
     chunks = _split_for_telegram(text, limit=3900)
     safe = not _has_unsafe_chunk(chunks, 3900)
+    note_kb = kb.note_actions_kb(note.note_id)
     if safe:
+        # placeholder редактируем без клавиатуры (кнопки вешаем на последнее сообщение,
+        # чтобы было одно «активное» меню под полным текстом).
         await placeholder.edit_text(
-            chunks[0], parse_mode=ParseMode.HTML, disable_web_page_preview=True
+            chunks[0], parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            reply_markup=note_kb if len(chunks) == 1 else None,
         )
-        for chunk in chunks[1:]:
-            await context.bot.send_message(
-                chat_id=msg.chat_id,
-                text=chunk,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+        for i, chunk in enumerate(chunks[1:], start=1):
+            kw = {"parse_mode": ParseMode.HTML, "disable_web_page_preview": True}
+            if i == len(chunks) - 1:
+                kw["reply_markup"] = note_kb
+            await context.bot.send_message(chat_id=msg.chat_id, text=chunk, **kw)
     else:
+        pieces = [text[i:i + 3900] for i in range(0, len(text), 3900)]
         await placeholder.edit_text(
-            text[:3900], parse_mode=None, disable_web_page_preview=True
+            pieces[0], parse_mode=None, disable_web_page_preview=True,
+            reply_markup=note_kb if len(pieces) == 1 else None,
         )
-        for i in range(3900, len(text), 3900):
-            await context.bot.send_message(
-                chat_id=msg.chat_id,
-                text=text[i:i + 3900],
-                parse_mode=None,
-                disable_web_page_preview=True,
-            )
+        for i, piece in enumerate(pieces[1:], start=1):
+            kw = {"parse_mode": None, "disable_web_page_preview": True}
+            if i == len(pieces) - 1:
+                kw["reply_markup"] = note_kb
+            await context.bot.send_message(chat_id=msg.chat_id, text=piece, **kw)
+
+    # Отдельные сообщения с кнопками для каждого созданного напоминания —
+    # чтобы их можно было сразу перенести/отменить, не открывая /reminders.
+    for r in scheduled:
+        await context.bot.send_message(
+            chat_id=msg.chat_id,
+            text=f"⏰ Напоминание #{r.reminder_id}: {fmt.esc(r.text)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb.reminder_actions_kb(r.reminder_id),
+        )
     logger.info(
         "note #%d for user %d: source=%s, reminders=%d",
         note_id, user.id, source, len(scheduled),
@@ -640,7 +918,8 @@ def _cancel_reminder_jobs(app: Application, reminder_id: int) -> None:
 
 
 async def _on_post_init(app: Application) -> None:
-    """Пере-планируем все pending напоминания и регистрируем периодическую чистку."""
+    """Пере-планируем все pending напоминания, регистрируем периодическую чистку,
+    и регистрируем выпадающее меню команд (setMyCommands)."""
     db: Database = app.bot_data["db"]
     pending = db.all_pending_reminders()
     now = int(time.time())
@@ -659,6 +938,13 @@ async def _on_post_init(app: Application) -> None:
             first=60,
             name="prune-reminders",
         )
+    try:
+        await app.bot.set_my_commands(
+            [BotCommand(name, desc) for name, desc in BOT_COMMANDS]
+        )
+        logger.info("set %d bot commands", len(BOT_COMMANDS))
+    except Exception:  # noqa: BLE001
+        logger.exception("failed to set bot commands")
 
 
 # ---- bootstrap ---------------------------------------------------------
@@ -694,6 +980,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("reminders", cmd_reminders))
     app.add_handler(CommandHandler("export_ical", cmd_export_ical))
 
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     # подхватываем динамические /get_N, /delete_N — telegram считает их командами
@@ -701,6 +988,21 @@ def build_app() -> Application:
 
     app.add_error_handler(_error)
     return app
+
+
+# Список команд для setMyCommands (выпадающее меню «Меню» рядом со скрепкой).
+BOT_COMMANDS: list[tuple[str, str]] = [
+    ("start", "🚀 Приветствие и краткая справка"),
+    ("help", "❓ Полный список команд"),
+    ("last", "📄 Последняя заметка"),
+    ("list", "📚 Список последних заметок"),
+    ("search", "🔍 Поиск по заметкам"),
+    ("reminders", "⏰ Активные напоминания"),
+    ("export_ical", "📅 Экспорт напоминаний в .ics"),
+    ("stats", "📊 Статистика"),
+    ("lang", "🌐 Язык распознавания (ru/en/auto)"),
+    ("forget_all", "🗑 Удалить все заметки"),
+]
 
 
 async def _error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
