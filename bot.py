@@ -618,14 +618,16 @@ def _schedule_reminder(app: Application, reminder: Reminder) -> None:
             data={"rid": reminder.reminder_id},
             name=f"reminder:advance:{reminder.reminder_id}",
         )
+    # Всегда планируем fire-job, даже если fire_delay <= 0 (рейс-кондишн между
+    # past-check у вызывающего и re-capture'ом now здесь). JobQueue корректно
+    # выполнит задачу немедленно при when=0, а callback пометит reminder fired.
     fire_delay = reminder.fire_at - now
-    if fire_delay > 0:
-        jq.run_once(
-            _job_reminder_fire,
-            when=fire_delay,
-            data={"rid": reminder.reminder_id},
-            name=f"reminder:fire:{reminder.reminder_id}",
-        )
+    jq.run_once(
+        _job_reminder_fire,
+        when=max(fire_delay, 0),
+        data={"rid": reminder.reminder_id},
+        name=f"reminder:fire:{reminder.reminder_id}",
+    )
 
 
 def _cancel_reminder_jobs(app: Application, reminder_id: int) -> None:
