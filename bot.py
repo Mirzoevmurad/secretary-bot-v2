@@ -53,6 +53,36 @@ async def _deny(update: Update) -> None:
     )
 
 
+def _split_for_telegram(text: str, limit: int = 3900) -> list[str]:
+    """Делит сообщение по двойным переводам строк, чтобы не превышать лимит Telegram (4096)."""
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    buf: list[str] = []
+    cur = 0
+    for block in text.split("\n\n"):
+        block_len = len(block) + 2
+        if cur + block_len > limit and buf:
+            parts.append("\n\n".join(buf))
+            buf = [block]
+            cur = block_len
+        else:
+            buf.append(block)
+            cur += block_len
+    if buf:
+        parts.append("\n\n".join(buf))
+    # на случай, если один блок сам по себе длиннее limit — режем по строкам
+    out: list[str] = []
+    for p in parts:
+        if len(p) <= limit:
+            out.append(p)
+            continue
+        # hard split
+        for i in range(0, len(p), limit):
+            out.append(p[i:i + limit])
+    return out
+
+
 def _convert_to_wav(src: Path, dst: Path) -> None:
     """OGG/Opus → 16kHz mono WAV. Whisper в Groq API также принимает исходный ogg,
     но конвертация уменьшает размер и нормализует."""
@@ -293,11 +323,28 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         note = db.get_note(note_id, user.id)
         assert note is not None
 
-    await placeholder.edit_text(
-        fmt.format_note(note),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
+    text = fmt.format_note(note)
+    # Telegram message limit is 4096 chars; чтобы не упасть на длинных заметках, режем по разделителям
+    chunks = _split_for_telegram(text, limit=3900)
+    if len(chunks) == 1:
+        await placeholder.edit_text(
+            chunks[0],
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    else:
+        await placeholder.edit_text(
+            chunks[0],
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        for chunk in chunks[1:]:
+            await context.bot.send_message(
+                chat_id=msg.chat_id,
+                text=chunk,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
     logger.info(
         "note #%d for user %d: %.1fs audio, STT %.1fs",
         note_id, user.id, duration, stt_seconds,
