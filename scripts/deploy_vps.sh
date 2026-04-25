@@ -14,8 +14,17 @@ log() { echo -e "\033[1m[secretary]\033[0m $*"; }
 die() { echo "FATAL: $*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "Запускайте от root (sudo)"
-[[ -n "${SECRETARY_BOT_TOKEN:-}" ]] || die "SECRETARY_BOT_TOKEN не задан в окружении"
-[[ -n "${GROQ_API_KEY:-}" ]] || die "GROQ_API_KEY не задан в окружении"
+
+# При повторном запуске: если env-файл уже есть и в окружении секретов нет — подтянем из него.
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+
+[[ -n "${SECRETARY_BOT_TOKEN:-}" ]] || die "SECRETARY_BOT_TOKEN не задан (передайте в окружении или подготовьте $ENV_FILE)"
+[[ -n "${GROQ_API_KEY:-}" ]] || die "GROQ_API_KEY не задан (передайте в окружении или подготовьте $ENV_FILE)"
 [[ -n "${ALLOWED_USER_IDS:-${TELEGRAM_OWNER_ID:-}}" ]] || die "ALLOWED_USER_IDS (или TELEGRAM_OWNER_ID) не задан"
 
 log "Устанавливаю системные пакеты..."
