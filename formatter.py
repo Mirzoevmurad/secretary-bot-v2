@@ -44,9 +44,12 @@ def fmt_category_emoji(cat: str) -> str:
 def format_note(note: Note) -> str:
     s = note.summary
     title = s.get("title") or "Без заголовка"
+    tldr = s.get("tldr") or ""
+    details = s.get("details") or ""
     summary = s.get("summary") or []
     tasks = s.get("tasks") or []
     questions = s.get("open_questions") or []
+    decisions = s.get("decisions") or []
     tags = s.get("tags") or []
     category = s.get("category") or "Другое"
 
@@ -62,11 +65,26 @@ def format_note(note: Note) -> str:
     lines.append("")
     lines.append(f"<b>{esc(title)}</b>")
 
+    if tldr:
+        lines.append("")
+        lines.append(f"<i>{esc(tldr)}</i>")
+
+    if details:
+        lines.append("")
+        lines.append("📖 <b>Подробно</b>")
+        lines.append(esc(details))
+
     if summary:
         lines.append("")
         lines.append("🔑 <b>Главное</b>")
         for item in summary:
             lines.append(f"• {esc(str(item))}")
+
+    if decisions:
+        lines.append("")
+        lines.append("⚖️ <b>Решения</b>")
+        for d in decisions:
+            lines.append(f"• {esc(str(d))}")
 
     if tasks:
         lines.append("")
