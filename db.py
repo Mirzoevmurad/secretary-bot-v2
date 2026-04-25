@@ -56,6 +56,22 @@ CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
     INSERT INTO notes_fts(notes_fts, rowid, title, transcript) VALUES('delete', old.note_id, old.title, old.transcript);
     INSERT INTO notes_fts(rowid, title, transcript) VALUES (new.note_id, new.title, new.transcript);
 END;
+
+CREATE TABLE IF NOT EXISTS reminders (
+    reminder_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    fire_at INTEGER NOT NULL,                 -- epoch UTC секунд
+    advance_minutes INTEGER NOT NULL DEFAULT 0,
+    text TEXT NOT NULL,
+    source_note_id INTEGER,                   -- если напоминание создано из заметки
+    status TEXT NOT NULL DEFAULT 'pending',   -- pending | fired | cancelled
+    fired_at INTEGER,
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reminders_user_status ON reminders(user_id, status, fire_at);
+CREATE INDEX IF NOT EXISTS idx_reminders_fire_at ON reminders(fire_at);
 """
 
 
@@ -71,6 +87,19 @@ class Note:
     summary: dict
     audio_path: str | None
     source: str
+
+
+@dataclass(slots=True)
+class Reminder:
+    reminder_id: int
+    user_id: int
+    created_at: int
+    fire_at: int
+    advance_minutes: int
+    text: str
+    source_note_id: int | None
+    status: str
+    fired_at: int | None
 
 
 class Database:
@@ -202,6 +231,83 @@ class Database:
         ).fetchall()
         return [_to_note(r) for r in rows]
 
+    # ---- reminders -----------------------------------------------------
+
+    def add_reminder(
+        self,
+        *,
+        user_id: int,
+        fire_at: int,
+        advance_minutes: int,
+        text: str,
+        source_note_id: int | None,
+    ) -> int:
+        now = int(time.time())
+        with self._tx() as c:
+            cur = c.execute(
+                """INSERT INTO reminders (user_id, created_at, fire_at, advance_minutes, text, source_note_id, status)
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
+                (user_id, now, fire_at, max(0, advance_minutes), text, source_note_id),
+            )
+            return int(cur.lastrowid)
+
+    def get_reminder(self, reminder_id: int, user_id: int) -> Reminder | None:
+        row = self._conn.execute(
+            "SELECT * FROM reminders WHERE reminder_id=? AND user_id=?",
+            (reminder_id, user_id),
+        ).fetchone()
+        return _to_reminder(row) if row else None
+
+    def get_reminder_any(self, reminder_id: int) -> Reminder | None:
+        """Без проверки user_id — для job-callback'ов, где user_id известен из самого reminder."""
+        row = self._conn.execute(
+            "SELECT * FROM reminders WHERE reminder_id=?",
+            (reminder_id,),
+        ).fetchone()
+        return _to_reminder(row) if row else None
+
+    def list_pending_reminders(self, user_id: int) -> list[Reminder]:
+        rows = self._conn.execute(
+            "SELECT * FROM reminders WHERE user_id=? AND status='pending' ORDER BY fire_at ASC",
+            (user_id,),
+        ).fetchall()
+        return [_to_reminder(r) for r in rows]
+
+    def all_pending_reminders(self) -> list[Reminder]:
+        """Используется при старте бота, чтобы перепланировать все висящие задачи."""
+        rows = self._conn.execute(
+            "SELECT * FROM reminders WHERE status='pending' ORDER BY fire_at ASC",
+        ).fetchall()
+        return [_to_reminder(r) for r in rows]
+
+    def mark_reminder_fired(self, reminder_id: int) -> None:
+        with self._tx() as c:
+            c.execute(
+                "UPDATE reminders SET status='fired', fired_at=? WHERE reminder_id=? AND status='pending'",
+                (int(time.time()), reminder_id),
+            )
+
+    def cancel_reminder(self, reminder_id: int, user_id: int) -> bool:
+        with self._tx() as c:
+            cur = c.execute(
+                "UPDATE reminders SET status='cancelled' WHERE reminder_id=? AND user_id=? AND status='pending'",
+                (reminder_id, user_id),
+            )
+            return cur.rowcount > 0
+
+    def prune_old_reminders(self, before_epoch: int) -> int:
+        """Удаляет fired/cancelled напоминания старше before_epoch (по fired_at или fire_at)."""
+        with self._tx() as c:
+            cur = c.execute(
+                """DELETE FROM reminders
+                   WHERE status IN ('fired', 'cancelled')
+                     AND COALESCE(fired_at, fire_at) < ?""",
+                (before_epoch,),
+            )
+            return cur.rowcount
+
+    # ---- stats ---------------------------------------------------------
+
     def stats(self, user_id: int) -> dict:
         row = self._conn.execute(
             """SELECT COUNT(*) AS total,
@@ -231,6 +337,20 @@ def _to_note(row: sqlite3.Row) -> Note:
         summary=json.loads(row["summary_json"]),
         audio_path=row["audio_path"],
         source=row["source"],
+    )
+
+
+def _to_reminder(row: sqlite3.Row) -> Reminder:
+    return Reminder(
+        reminder_id=row["reminder_id"],
+        user_id=row["user_id"],
+        created_at=row["created_at"],
+        fire_at=row["fire_at"],
+        advance_minutes=row["advance_minutes"],
+        text=row["text"],
+        source_note_id=row["source_note_id"],
+        status=row["status"],
+        fired_at=row["fired_at"],
     )
 
 

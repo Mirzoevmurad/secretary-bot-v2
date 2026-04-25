@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import html
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
-from db import Note
+from db import Note, Reminder
 from llm import Summary
 
 
@@ -21,9 +22,44 @@ def fmt_duration(seconds: float | None) -> str:
     return f"{s // 60}м {s % 60:02d}с"
 
 
-def fmt_created_at(ts: int) -> str:
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
+def fmt_created_at(ts: int, tz_name: str | None = None) -> str:
+    if tz_name:
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:  # noqa: BLE001
+            tz = None
+    else:
+        tz = None
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    dt = dt.astimezone(tz) if tz else dt.astimezone()
     return dt.strftime("%d.%m.%Y %H:%M")
+
+
+def fmt_fire_at(ts: int, tz_name: str | None = None) -> str:
+    """Время в локальной TZ + относительное «через X»."""
+    try:
+        tz = ZoneInfo(tz_name) if tz_name else None
+    except Exception:  # noqa: BLE001
+        tz = None
+    dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+    dt = dt_utc.astimezone(tz) if tz else dt_utc.astimezone()
+    abs_str = dt.strftime("%d.%m.%Y %H:%M")
+    delta = ts - int(datetime.now(tz=timezone.utc).timestamp())
+    if delta < 0:
+        return f"{abs_str} (прошло)"
+    if delta < 60:
+        rel = "меньше минуты"
+    elif delta < 3600:
+        rel = f"через {delta // 60}м"
+    elif delta < 86400:
+        h = delta // 3600
+        m = (delta % 3600) // 60
+        rel = f"через {h}ч {m}м" if m else f"через {h}ч"
+    else:
+        d = delta // 86400
+        h = (delta % 86400) // 3600
+        rel = f"через {d}д {h}ч" if h else f"через {d}д"
+    return f"{abs_str} ({rel})"
 
 
 def fmt_category_emoji(cat: str) -> str:
@@ -41,7 +77,7 @@ def fmt_category_emoji(cat: str) -> str:
     return mapping.get(cat, "📝")
 
 
-def format_note(note: Note) -> str:
+def format_note(note: Note, *, tz_name: str | None = None, scheduled_reminders: list[Reminder] | None = None) -> str:
     s = note.summary
     title = s.get("title") or "Без заголовка"
     tldr = s.get("tldr") or ""
@@ -54,10 +90,14 @@ def format_note(note: Note) -> str:
     category = s.get("category") or "Другое"
 
     lines: list[str] = []
+    source = (note.source or "voice")
+    src_emoji = "📝" if source == "text" else "🎙"
     lines.append(
-        f"📝 <b>Заметка #{note.note_id}</b> · {esc(fmt_created_at(note.created_at))}"
+        f"{src_emoji} <b>Заметка #{note.note_id}</b> · {esc(fmt_created_at(note.created_at, tz_name))}"
     )
-    meta_bits = [f"⏱ {fmt_duration(note.duration_seconds)}"]
+    meta_bits: list[str] = []
+    if note.duration_seconds:
+        meta_bits.append(f"⏱ {fmt_duration(note.duration_seconds)}")
     if note.lang:
         meta_bits.append(f"🌐 {esc(note.lang)}")
     meta_bits.append(f"{fmt_category_emoji(category)} {esc(category)}")
@@ -107,6 +147,15 @@ def format_note(note: Note) -> str:
         for q in questions:
             lines.append(f"• {esc(str(q))}")
 
+    if scheduled_reminders:
+        lines.append("")
+        lines.append("🔔 <b>Напоминания</b>")
+        for r in scheduled_reminders:
+            adv = f", за {r.advance_minutes}м" if r.advance_minutes else ""
+            lines.append(
+                f"• <b>#{r.reminder_id}</b> · {esc(fmt_fire_at(r.fire_at, tz_name))}{adv} — {esc(r.text)}"
+            )
+
     if tags:
         lines.append("")
         lines.append(" ".join(f"#{esc(str(t)).replace(' ', '_')}" for t in tags))
@@ -114,6 +163,39 @@ def format_note(note: Note) -> str:
     lines.append("")
     lines.append(f"📄 Транскрипт: /get_{note.note_id}")
     return "\n".join(lines)
+
+
+def format_reminders_list(reminders: list[Reminder], tz_name: str | None = None) -> str:
+    if not reminders:
+        return (
+            "🔕 Напоминаний нет.\n\n"
+            "Запишите голосовое или пришлите текст — что-то вроде "
+            "<i>«завтра в 12:30 встреча с тимлидом, напомни за 5 минут»</i>."
+        )
+    lines = [f"🔔 <b>Активные напоминания</b> ({len(reminders)})"]
+    for r in reminders:
+        adv = f" · за {r.advance_minutes}м" if r.advance_minutes else ""
+        lines.append("")
+        lines.append(f"<b>#{r.reminder_id}</b> · {esc(fmt_fire_at(r.fire_at, tz_name))}{adv}")
+        lines.append(esc(r.text))
+        lines.append(f"<i>Отменить: /cancel_{r.reminder_id}</i>")
+    return "\n".join(lines)
+
+
+def format_reminder_advance(reminder: Reminder, tz_name: str | None = None) -> str:
+    return (
+        f"⏰ <b>Скоро напоминание</b>\n"
+        f"<i>{esc(fmt_fire_at(reminder.fire_at, tz_name))}</i>\n\n"
+        f"<b>{esc(reminder.text)}</b>"
+    )
+
+
+def format_reminder_fire(reminder: Reminder, tz_name: str | None = None) -> str:
+    return (
+        f"🔔 <b>Сейчас!</b>\n\n"
+        f"<b>{esc(reminder.text)}</b>\n\n"
+        f"<i>Время: {esc(fmt_fire_at(reminder.fire_at, tz_name))}</i>"
+    )
 
 
 def format_list(notes: list[Note]) -> str:
@@ -170,17 +252,22 @@ def format_stats(stats: dict) -> str:
 def format_help() -> str:
     return (
         "🤖 <b>Бот-секретарь</b>\n"
-        "Пришлите голосовое сообщение или аудиофайл — я сделаю из него структурированную заметку: заголовок, саммари, задачи, теги.\n\n"
-        "<b>Команды</b>\n"
-        "/start — приветствие\n"
+        "Пришлите <b>голосовое</b> или <b>текст</b> — соберу структурированную заметку: "
+        "заголовок, саммари, задачи, теги. Если в речи есть «напомни в Y часов» — поставлю напоминание.\n\n"
+        "<b>Заметки</b>\n"
         "/last — повторить последнюю заметку\n"
         "/list — список последних 10 заметок\n"
         "/search &lt;текст&gt; — поиск по всем заметкам\n"
-        "/stats — ваша статистика\n"
-        "/lang ru|en|auto — язык распознавания по умолчанию\n"
         "/get_&lt;id&gt; — транскрипт заметки\n"
         "/delete_&lt;id&gt; — удалить заметку\n"
         "/forget_all — удалить все заметки\n"
+        "\n<b>Напоминания</b>\n"
+        "/reminders — активные напоминания\n"
+        "/cancel_&lt;id&gt; — отменить напоминание\n"
+        "/export_ical — выгрузить все активные напоминания файлом .ics (импортируется в любой календарь)\n"
+        "\n<b>Прочее</b>\n"
+        "/stats — ваша статистика\n"
+        "/lang ru|en|auto — язык распознавания\n"
         "/help — эта справка"
     )
 
@@ -189,10 +276,17 @@ def format_processing(note_id_hint: str = "") -> str:
     return "🎧 Слушаю… (распознаю речь и структурирую)"
 
 
+def format_processing_text() -> str:
+    return "🧠 Обрабатываю текст…"
+
+
 def format_welcome() -> str:
     return (
         "👋 Привет! Я бот-секретарь.\n\n"
-        "Пришлите мне голосовое сообщение — я распознаю речь и соберу структурированную заметку с саммари, задачами и тегами.\n\n"
+        "Пришлите <b>голосовое</b> или <b>текстовое</b> сообщение — соберу из него "
+        "структурированную заметку с саммари, задачами и тегами.\n\n"
+        "Если в речи есть «завтра в 12:30 встреча с тимлидом, напомни за 5 минут» — "
+        "автоматически поставлю напоминание и пришлю уведомление вовремя.\n\n"
         "Команды: /help"
     )
 

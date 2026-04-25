@@ -15,13 +15,30 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "Запускайте от root (sudo)"
 
-# При повторном запуске: если env-файл уже есть и в окружении секретов нет — подтянем из него.
+# Приоритет переменных: значения из текущего окружения > значения из $ENV_FILE.
+# Это нужно, чтобы при ротации токена / ключа можно было передать новый секрет
+# через env, а старое значение из файла его не перезаписало.
+declare -A USER_ENV
+for v in SECRETARY_BOT_TOKEN GROQ_API_KEY ALLOWED_USER_IDS TELEGRAM_OWNER_ID \
+         STT_MODEL LLM_MODEL KEEP_AUDIO DEFAULT_LANG MAX_AUDIO_MB \
+         TZ_NAME DEFAULT_ADVANCE_MINUTES; do
+    if [[ -n "${!v:-}" ]]; then
+        USER_ENV[$v]="${!v}"
+    fi
+done
+
+# Подтягиваем env-файл, если есть.
 if [[ -f "$ENV_FILE" ]]; then
     set -a
     # shellcheck disable=SC1090
     source "$ENV_FILE"
     set +a
 fi
+
+# Восстанавливаем переменные, переданные пользователем (имеют приоритет).
+for v in "${!USER_ENV[@]}"; do
+    export "$v"="${USER_ENV[$v]}"
+done
 
 [[ -n "${SECRETARY_BOT_TOKEN:-}" ]] || die "SECRETARY_BOT_TOKEN не задан (передайте в окружении или подготовьте $ENV_FILE)"
 [[ -n "${GROQ_API_KEY:-}" ]] || die "GROQ_API_KEY не задан (передайте в окружении или подготовьте $ENV_FILE)"
@@ -66,6 +83,8 @@ LLM_MODEL=${LLM_MODEL:-llama-3.3-70b-versatile}
 KEEP_AUDIO=${KEEP_AUDIO:-false}
 DEFAULT_LANG=${DEFAULT_LANG:-auto}
 MAX_AUDIO_MB=${MAX_AUDIO_MB:-25}
+TZ_NAME=${TZ_NAME:-Europe/Moscow}
+DEFAULT_ADVANCE_MINUTES=${DEFAULT_ADVANCE_MINUTES:-5}
 ENV
 chmod 600 "$ENV_FILE"
 chown root:"$APP_USER" "$ENV_FILE"

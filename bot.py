@@ -22,8 +22,13 @@ from telegram.ext import (
 )
 
 from config import Config
-from db import Database, Note
+from db import Database, Note, Reminder
 from llm import GroqLLM, LLMError, Summary
+from reminders import (
+    materialize_reminders,
+    now_context_block,
+    reminders_to_ical,
+)
 from stt import GroqSTT, STTError
 import formatter as fmt
 
@@ -178,12 +183,13 @@ async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(context, update.effective_user.id):
         await _deny(update)
         return
+    cfg: Config = context.bot_data["cfg"]
     db: Database = context.bot_data["db"]
     note = db.last_note(update.effective_user.id)
     if note is None:
         await update.effective_message.reply_text("Заметок пока нет.")
         return
-    await _reply_long_html(update.effective_message, fmt.format_note(note))
+    await _reply_long_html(update.effective_message, fmt.format_note(note, tz_name=cfg.tz))
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -245,22 +251,70 @@ async def cmd_forget_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.effective_message.reply_text(f"🗑 Удалено заметок: {n}")
 
 
+async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_allowed(context, update.effective_user.id):
+        await _deny(update)
+        return
+    cfg: Config = context.bot_data["cfg"]
+    db: Database = context.bot_data["db"]
+    items = db.list_pending_reminders(update.effective_user.id)
+    await _reply_long_html(
+        update.effective_message, fmt.format_reminders_list(items, cfg.tz)
+    )
+
+
+async def cmd_export_ical(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_allowed(context, update.effective_user.id):
+        await _deny(update)
+        return
+    db: Database = context.bot_data["db"]
+    items = db.list_pending_reminders(update.effective_user.id)
+    if not items:
+        await update.effective_message.reply_text(
+            "🔕 Активных напоминаний нет — экспортировать нечего."
+        )
+        return
+    ics = reminders_to_ical(items, calendar_name=f"secretary-bot-{update.effective_user.id}")
+    from io import BytesIO
+    buf = BytesIO(ics.encode("utf-8"))
+    buf.name = "reminders.ics"
+    await update.effective_message.reply_document(
+        document=buf,
+        filename="reminders.ics",
+        caption=(
+            f"📅 {len(items)} напоминаний в формате iCalendar (.ics).\n"
+            "Откройте файл на телефоне — система предложит добавить события в календарь."
+        ),
+    )
+
+
 # --- /get_N и /delete_N как динамические команды -----------------------
 
 
 _GET_RE = re.compile(r"^/get_(\d+)(?:@\w+)?$")
 _DELETE_RE = re.compile(r"^/delete_(\d+)(?:@\w+)?$")
+_CANCEL_RE = re.compile(r"^/cancel_(\d+)(?:@\w+)?$")
+
+MIN_TEXT_NOTE_LEN = 3
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает любые текстовые сообщения, включая динамические команды /get_/delete_/cancel_.
+
+    Если это плоский текст без команд — обрабатываем как заметку (тот же пайплайн, что у голоса,
+    только без STT).
+    """
     if not _is_allowed(context, update.effective_user.id):
         await _deny(update)
         return
     txt = (update.effective_message.text or "").strip()
+    if not txt:
+        return
+    db: Database = context.bot_data["db"]
+
     m = _GET_RE.match(txt)
     if m:
         note_id = int(m.group(1))
-        db: Database = context.bot_data["db"]
         note = db.get_note(note_id, update.effective_user.id)
         if note is None:
             await update.effective_message.reply_text(f"Заметка #{note_id} не найдена.")
@@ -270,15 +324,51 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     m = _DELETE_RE.match(txt)
     if m:
         note_id = int(m.group(1))
-        db: Database = context.bot_data["db"]
         ok = db.delete_note(note_id, update.effective_user.id)
         await update.effective_message.reply_text(
             f"🗑 Заметка #{note_id} удалена." if ok else f"Заметка #{note_id} не найдена."
         )
         return
-    # любой другой текст — подсказка
-    await update.effective_message.reply_text(
-        "Пришлите голосовое сообщение 🎤 — я обработаю. /help для команд."
+    m = _CANCEL_RE.match(txt)
+    if m:
+        rid = int(m.group(1))
+        ok = db.cancel_reminder(rid, update.effective_user.id)
+        if ok:
+            _cancel_reminder_jobs(context.application, rid)
+            await update.effective_message.reply_text(f"🗑 Напоминание #{rid} отменено.")
+        else:
+            await update.effective_message.reply_text(f"Напоминание #{rid} не найдено или уже отменено.")
+        return
+
+    # неизвестная /-команда → справка
+    if txt.startswith("/"):
+        await update.effective_message.reply_text(
+            "Неизвестная команда. /help — список команд."
+        )
+        return
+
+    # плоский текст → пропускаем через тот же пайплайн, что и голос (но без STT)
+    if len(txt) < MIN_TEXT_NOTE_LEN:
+        await update.effective_message.reply_text(
+            "Текст слишком короткий. Пришлите хотя бы пару предложений или голосовое 🎤."
+        )
+        return
+
+    user = update.effective_user
+    db.upsert_user(user.id, user.username, user.first_name, user.last_name)
+    placeholder = await update.effective_message.reply_text(fmt.format_processing_text())
+    await context.bot.send_chat_action(
+        chat_id=update.effective_message.chat_id, action=ChatAction.TYPING
+    )
+    await _process_summary(
+        update,
+        context,
+        placeholder=placeholder,
+        transcript=txt,
+        lang=None,
+        duration=None,
+        source="text",
+        audio_path_saved=None,
     )
 
 
@@ -345,24 +435,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lang = stt_out.get("language")
         duration = stt_out.get("duration") or float(tg_audio.duration or 0)
 
-        # --- LLM -------------------------------------------------------
-        try:
-            summary: Summary = await llm.structure(transcript)
-        except LLMError as e:
-            await placeholder.edit_text(
-                f"⚠️ Распознал текст, но не смог структурировать: {e}\n\n"
-                f"📄 Транскрипт:\n{transcript[:3500]}"
-            )
-            return
-        except Exception as e:  # noqa: BLE001
-            logger.exception("LLM error")
-            await placeholder.edit_text(
-                f"⚠️ Ошибка структурирования ({type(e).__name__}).\n\n"
-                f"📄 Транскрипт:\n{transcript[:3500]}"
-            )
-            return
-
-        # --- сохранить ------------------------------------------------
+        # --- сохранить аудио, если просили --------------------------
         audio_path_saved: str | None = None
         if cfg.keep_audio:
             cfg.audio_dir.mkdir(parents=True, exist_ok=True)
@@ -370,29 +443,92 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             saved.write_bytes(src.read_bytes())
             audio_path_saved = str(saved)
 
-        note_id = db.add_note(
-            user_id=user.id,
-            transcript=transcript,
-            summary=summary.model_dump(),
-            title=summary.title,
-            lang=lang,
-            duration_seconds=duration,
-            audio_path=audio_path_saved,
-            source="voice" if msg.voice else "audio",
-        )
-        note = db.get_note(note_id, user.id)
-        assert note is not None
+    # --- LLM + save + reminders ---------------------------------------
+    await _process_summary(
+        update,
+        context,
+        placeholder=placeholder,
+        transcript=transcript,
+        lang=lang,
+        duration=duration,
+        source="voice" if msg.voice else "audio",
+        audio_path_saved=audio_path_saved,
+    )
+    logger.info("note for user %d: %.1fs audio, STT %.1fs", user.id, duration, stt_seconds)
 
-    text = fmt.format_note(note)
-    # Telegram message limit = 4096 символов. Если влезает — редактируем placeholder; иначе редактируем
-    # placeholder первым куском и шлём остальные доп. сообщениями.
+
+# ---- shared LLM + save + reminders pipeline ----------------------------
+
+
+async def _process_summary(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    placeholder,
+    transcript: str,
+    lang: str | None,
+    duration: float | None,
+    source: str,  # "voice" | "audio" | "text"
+    audio_path_saved: str | None,
+) -> None:
+    """Общий пайплайн для голоса и текста: LLM → DB → планирование напоминаний → ответ."""
+    user = update.effective_user
+    cfg: Config = context.bot_data["cfg"]
+    db: Database = context.bot_data["db"]
+    llm: GroqLLM = context.bot_data["llm"]
+    msg = update.effective_message
+
+    try:
+        summary: Summary = await llm.structure(
+            transcript, now_context=now_context_block(cfg.tz)
+        )
+    except LLMError as e:
+        await placeholder.edit_text(
+            f"⚠️ Не смог структурировать: {e}\n\n📄 Текст:\n{transcript[:3500]}",
+            parse_mode=None,
+            disable_web_page_preview=True,
+        )
+        return
+    except Exception as e:  # noqa: BLE001
+        logger.exception("LLM error")
+        await placeholder.edit_text(
+            f"⚠️ Ошибка структурирования ({type(e).__name__}).\n\n📄 Текст:\n{transcript[:3500]}",
+            parse_mode=None,
+            disable_web_page_preview=True,
+        )
+        return
+
+    note_id = db.add_note(
+        user_id=user.id,
+        transcript=transcript,
+        summary=summary.model_dump(),
+        title=summary.title,
+        lang=lang,
+        duration_seconds=duration,
+        audio_path=audio_path_saved,
+        source=source,
+    )
+    note = db.get_note(note_id, user.id)
+    assert note is not None
+
+    # materialize + schedule reminders
+    scheduled = materialize_reminders(
+        db,
+        user.id,
+        summary.reminders,
+        cfg.tz,
+        cfg.default_advance_minutes,
+        source_note_id=note_id,
+    )
+    for r in scheduled:
+        _schedule_reminder(context.application, r)
+
+    text = fmt.format_note(note, tz_name=cfg.tz, scheduled_reminders=scheduled)
     chunks = _split_for_telegram(text, limit=3900)
     safe = not _has_unsafe_chunk(chunks, 3900)
     if safe:
         await placeholder.edit_text(
-            chunks[0],
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+            chunks[0], parse_mode=ParseMode.HTML, disable_web_page_preview=True
         )
         for chunk in chunks[1:]:
             await context.bot.send_message(
@@ -402,9 +538,9 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 disable_web_page_preview=True,
             )
     else:
-        # очень редкий путь: атомарный кусок без границ — режем посимвольно как plain text.
-        # parse_mode=None обязателен из-за Defaults(parse_mode=HTML) в Application.
-        await placeholder.edit_text(text[:3900], parse_mode=None, disable_web_page_preview=True)
+        await placeholder.edit_text(
+            text[:3900], parse_mode=None, disable_web_page_preview=True
+        )
         for i in range(3900, len(text), 3900):
             await context.bot.send_message(
                 chat_id=msg.chat_id,
@@ -413,9 +549,110 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 disable_web_page_preview=True,
             )
     logger.info(
-        "note #%d for user %d: %.1fs audio, STT %.1fs",
-        note_id, user.id, duration, stt_seconds,
+        "note #%d for user %d: source=%s, reminders=%d",
+        note_id, user.id, source, len(scheduled),
     )
+
+
+# ---- reminders scheduling ---------------------------------------------
+
+
+async def _job_reminder_advance(context: ContextTypes.DEFAULT_TYPE) -> None:
+    rid = context.job.data["rid"]
+    db: Database = context.application.bot_data["db"]
+    cfg: Config = context.application.bot_data["cfg"]
+    r = db.get_reminder_any(rid)
+    if r is None or r.status != "pending":
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=r.user_id,
+            text=fmt.format_reminder_advance(r, cfg.tz),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("failed to send advance reminder %d", rid)
+
+
+async def _job_reminder_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
+    rid = context.job.data["rid"]
+    db: Database = context.application.bot_data["db"]
+    cfg: Config = context.application.bot_data["cfg"]
+    r = db.get_reminder_any(rid)
+    if r is None or r.status != "pending":
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=r.user_id,
+            text=fmt.format_reminder_fire(r, cfg.tz),
+            parse_mode=ParseMode.HTML,
+        )
+    finally:
+        db.mark_reminder_fired(rid)
+
+
+async def _job_prune_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Удаляет fired/cancelled напоминания старше 24 часов."""
+    db: Database = context.application.bot_data["db"]
+    cutoff = int(time.time()) - 24 * 3600
+    n = db.prune_old_reminders(cutoff)
+    if n:
+        logger.info("pruned %d old reminders", n)
+
+
+def _schedule_reminder(app: Application, reminder: Reminder) -> None:
+    jq = app.job_queue
+    if jq is None:
+        logger.warning("job_queue недоступен; напоминание #%d не запланировано", reminder.reminder_id)
+        return
+    now = int(time.time())
+    advance_at = reminder.fire_at - reminder.advance_minutes * 60
+    if reminder.advance_minutes > 0 and advance_at > now:
+        jq.run_once(
+            _job_reminder_advance,
+            when=advance_at - now,
+            data={"rid": reminder.reminder_id},
+            name=f"reminder:advance:{reminder.reminder_id}",
+        )
+    fire_delay = reminder.fire_at - now
+    if fire_delay > 0:
+        jq.run_once(
+            _job_reminder_fire,
+            when=fire_delay,
+            data={"rid": reminder.reminder_id},
+            name=f"reminder:fire:{reminder.reminder_id}",
+        )
+
+
+def _cancel_reminder_jobs(app: Application, reminder_id: int) -> None:
+    jq = app.job_queue
+    if jq is None:
+        return
+    for name in (f"reminder:advance:{reminder_id}", f"reminder:fire:{reminder_id}"):
+        for job in jq.get_jobs_by_name(name):
+            job.schedule_removal()
+
+
+async def _on_post_init(app: Application) -> None:
+    """Пере-планируем все pending напоминания и регистрируем периодическую чистку."""
+    db: Database = app.bot_data["db"]
+    pending = db.all_pending_reminders()
+    now = int(time.time())
+    rescheduled = 0
+    for r in pending:
+        if r.fire_at <= now:
+            db.mark_reminder_fired(r.reminder_id)
+            continue
+        _schedule_reminder(app, r)
+        rescheduled += 1
+    logger.info("rescheduled %d pending reminders", rescheduled)
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            _job_prune_reminders,
+            interval=24 * 3600,
+            first=60,
+            name="prune-reminders",
+        )
 
 
 # ---- bootstrap ---------------------------------------------------------
@@ -428,7 +665,13 @@ def build_app() -> Application:
     llm = GroqLLM(cfg.groq_api_key, cfg.llm_model)
 
     defaults = Defaults(parse_mode=ParseMode.HTML)
-    app = ApplicationBuilder().token(cfg.bot_token).defaults(defaults).build()
+    app = (
+        ApplicationBuilder()
+        .token(cfg.bot_token)
+        .defaults(defaults)
+        .post_init(_on_post_init)
+        .build()
+    )
     app.bot_data["cfg"] = cfg
     app.bot_data["db"] = db
     app.bot_data["stt"] = stt
@@ -442,6 +685,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CommandHandler("forget_all", cmd_forget_all))
+    app.add_handler(CommandHandler("reminders", cmd_reminders))
+    app.add_handler(CommandHandler("export_ical", cmd_export_ical))
 
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
