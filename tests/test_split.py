@@ -57,6 +57,20 @@ def test_long_line_splits_at_sentences():
         assert len(c) <= 300
 
 
+def test_sentence_split_preserves_spacing():
+    """При склейке предложений пробел между ними не должен теряться."""
+    s = "Первое предложение про что-то очень важное и нужное. " * 20
+    chunks = _split_for_telegram(s, limit=300)
+    rejoined = " ".join(chunks)
+    # ни в одном из кусков не должно быть склейки `.П` (точка вплотную к заглавной)
+    for c in chunks:
+        assert ".П" not in c, f"sentences glued without space: {c!r}"
+    # суммарно текст восстановим (с точностью до пробелов на границах кусков)
+    normalized_orig = " ".join(s.split())
+    normalized_join = " ".join(rejoined.split())
+    assert normalized_orig.strip() == normalized_join.strip()
+
+
 def test_safe_flag_with_normal_text():
     text = "обычный\n\nтекст " * 100
     chunks = _split_for_telegram(text, limit=500)

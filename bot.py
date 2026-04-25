@@ -100,8 +100,9 @@ def _split_for_telegram(text: str, limit: int = 3900) -> list[str]:
         if len(c) <= limit:
             refined.append(c)
             continue
+        # делим по предложениям, сохраняя пробел при склейке (sep=" ")
         sentences = c.replace(". ", ".\x00").split("\x00")
-        sub = _group(sentences, "")
+        sub = _group(sentences, " ")
         # Шаг 3b: одно предложение длиннее limit — режем по словам.
         sub_refined: list[str] = []
         for s in sub:
@@ -135,10 +136,11 @@ async def _reply_long_html(msg, text: str, limit: int = 3900) -> None:
         for chunk in chunks:
             await msg.reply_html(chunk, disable_web_page_preview=True)
         return
-    # fallback: plain text
-    plain = text  # без перевода в plain — Telegram сам отрисует тэги как символы
-    for i in range(0, len(plain), limit):
-        await msg.reply_text(plain[i:i + limit], disable_web_page_preview=True)
+    # fallback: режем посимвольно и шлём как plain text. parse_mode=None обязателен —
+    # Application имеет Defaults(parse_mode=ParseMode.HTML), без явного None Telegram
+    # будет интерпретировать порванный тэг как HTML и отвергнет сообщение.
+    for i in range(0, len(text), limit):
+        await msg.reply_text(text[i:i + limit], parse_mode=None, disable_web_page_preview=True)
 
 
 def _convert_to_wav(src: Path, dst: Path) -> None:
@@ -400,12 +402,14 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 disable_web_page_preview=True,
             )
     else:
-        # очень редкий путь: атомарный кусок без границ — режем посимвольно как plain text
-        await placeholder.edit_text(text[:3900], disable_web_page_preview=True)
+        # очень редкий путь: атомарный кусок без границ — режем посимвольно как plain text.
+        # parse_mode=None обязателен из-за Defaults(parse_mode=HTML) в Application.
+        await placeholder.edit_text(text[:3900], parse_mode=None, disable_web_page_preview=True)
         for i in range(3900, len(text), 3900):
             await context.bot.send_message(
                 chat_id=msg.chat_id,
                 text=text[i:i + 3900],
+                parse_mode=None,
                 disable_web_page_preview=True,
             )
     logger.info(
