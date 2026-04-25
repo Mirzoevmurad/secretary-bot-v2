@@ -328,11 +328,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: Database = context.bot_data["db"]
 
     # Если ждём ответ на edit-запрос — обработать первым делом, до /-команд и LLM.
+    # Принимаем как явный reply на ForceReply-промпт, так и любое следующее НЕ-команд-
+    # ное сообщение (UI обещает оба варианта). /команды не перехватываем, чтобы юзер
+    # мог отменить edit любой командой типа /reminders или /list.
     pending = context.user_data.get("pending_edit") if context.user_data is not None else None
-    if pending and update.effective_message.reply_to_message:
-        if update.effective_message.reply_to_message.message_id == pending.get("prompt_id"):
+    if pending:
+        is_reply_to_prompt = (
+            update.effective_message.reply_to_message is not None
+            and update.effective_message.reply_to_message.message_id == pending.get("prompt_id")
+        )
+        if is_reply_to_prompt or not txt.startswith("/"):
             await _apply_pending_edit(update, context, pending, txt)
             return
+        # /-команда при активном pending_edit — снимаем pending и пропускаем команду дальше,
+        # чтобы edit не «прилип» к следующему случайному тексту в будущем.
+        if context.user_data is not None:
+            context.user_data.pop("pending_edit", None)
 
     m = _GET_RE.match(txt)
     if m:
@@ -919,18 +930,46 @@ def _cancel_reminder_jobs(app: Application, reminder_id: int) -> None:
 
 async def _on_post_init(app: Application) -> None:
     """Пере-планируем все pending напоминания, регистрируем периодическую чистку,
-    и регистрируем выпадающее меню команд (setMyCommands)."""
+    и регистрируем выпадающее меню команд (setMyCommands).
+
+    Для напоминаний с fire_at <= now (например, оставшихся в pending после неудачной
+    доставки в прошлом или после простоя бота) пытаемся отправить запоздалое уведомление
+    с пометкой «пропущено». Помечаем fired только при успехе — иначе остаётся pending,
+    чтобы следующий рестарт попробовал ещё раз. Это сохраняет retry-семантику
+    _job_reminder_fire.
+    """
     db: Database = app.bot_data["db"]
+    cfg: Config = app.bot_data["cfg"]
     pending = db.all_pending_reminders()
     now = int(time.time())
     rescheduled = 0
+    missed_sent = 0
+    missed_kept = 0
     for r in pending:
         if r.fire_at <= now:
+            try:
+                await app.bot.send_message(
+                    chat_id=r.user_id,
+                    text="⚠️ Пропущенное напоминание (не доставилось ранее):\n\n"
+                    + fmt.format_reminder_fire(r, cfg.tz),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "failed to send belated reminder %d; leaving as pending for next restart",
+                    r.reminder_id,
+                )
+                missed_kept += 1
+                continue
             db.mark_reminder_fired(r.reminder_id)
+            missed_sent += 1
             continue
         _schedule_reminder(app, r)
         rescheduled += 1
-    logger.info("rescheduled %d pending reminders", rescheduled)
+    logger.info(
+        "rescheduled %d pending reminders, sent %d belated, %d kept pending",
+        rescheduled, missed_sent, missed_kept,
+    )
     if app.job_queue is not None:
         app.job_queue.run_repeating(
             _job_prune_reminders,
