@@ -587,8 +587,12 @@ async def _job_reminder_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
             text=fmt.format_reminder_fire(r, cfg.tz),
             parse_mode=ParseMode.HTML,
         )
-    finally:
-        db.mark_reminder_fired(rid)
+    except Exception:  # noqa: BLE001
+        # Если уведомление не доставилось — оставляем reminder в pending, чтобы
+        # JobQueue/restart-rescheduler смог его попробовать ещё раз. Не помечаем fired.
+        logger.exception("failed to send fire reminder %d; leaving as pending", rid)
+        return
+    db.mark_reminder_fired(rid)
 
 
 async def _job_prune_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:

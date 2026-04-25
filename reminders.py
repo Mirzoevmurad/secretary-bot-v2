@@ -33,6 +33,20 @@ _ISO_RE = re.compile(
 )
 
 
+def _parse_offset(tz_str: str) -> timezone | None:
+    """Парсит '+0300', '+03:00', '-0530', 'Z' в datetime.timezone."""
+    if not tz_str:
+        return None
+    if tz_str == "Z":
+        return timezone.utc
+    sign = 1 if tz_str[0] == "+" else -1
+    rest = tz_str[1:].replace(":", "")
+    if len(rest) != 4 or not rest.isdigit():
+        return None
+    hh, mm = int(rest[:2]), int(rest[2:])
+    return timezone(sign * timedelta(hours=hh, minutes=mm))
+
+
 def parse_iso_to_epoch(iso: str, default_tz: str) -> int | None:
     """Преобразует ISO 8601 строку в epoch (UTC seconds). Возвращает None, если не парсится."""
     if not iso:
@@ -50,13 +64,21 @@ def parse_iso_to_epoch(iso: str, default_tz: str) -> int | None:
                 dt = dt.replace(tzinfo=timezone.utc)
         return int(dt.astimezone(timezone.utc).timestamp())
     except (ValueError, TypeError):
-        # fallback на регулярку
+        # fallback на регулярку (для Python 3.10 и форматов вроде +0300 без двоеточия)
         m = _ISO_RE.match(iso)
         if not m:
             return None
         y, mo, d, hh, mm, ss, tz = m.groups()
         try:
-            tzinfo = ZoneInfo(default_tz) if not tz else timezone.utc
+            if tz:
+                tzinfo: timezone | ZoneInfo | None = _parse_offset(tz)
+                if tzinfo is None:
+                    return None
+            else:
+                try:
+                    tzinfo = ZoneInfo(default_tz)
+                except Exception:  # noqa: BLE001
+                    tzinfo = timezone.utc
             dt = datetime(int(y), int(mo), int(d), int(hh), int(mm), int(ss or 0), tzinfo=tzinfo)
             return int(dt.astimezone(timezone.utc).timestamp())
         except (ValueError, TypeError):

@@ -139,10 +139,25 @@ def test_materialize_skips_past(db: Database) -> None:
 def test_materialize_default_advance(db: Database) -> None:
     db.upsert_user(1, "a", "A", None)
     future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
-    # advance_minutes не задан → берём дефолтные 5
-    spec = ReminderSpec(what="x", fire_at_iso=future, advance_minutes=5)
-    out = materialize_reminders(db, 1, [spec], "Europe/Moscow", 5, source_note_id=None)
-    assert out[0].advance_minutes == 5
+    # LLM не указал advance → падает в default_advance (10) из конфига
+    spec = ReminderSpec(what="x", fire_at_iso=future)  # advance_minutes=None
+    out = materialize_reminders(db, 1, [spec], "Europe/Moscow", 10, source_note_id=None)
+    assert out[0].advance_minutes == 10
+    # LLM указал явно → используется его значение
+    spec2 = ReminderSpec(what="y", fire_at_iso=future, advance_minutes=30)
+    out2 = materialize_reminders(db, 1, [spec2], "Europe/Moscow", 10, source_note_id=None)
+    assert out2[0].advance_minutes == 30
+
+
+def test_parse_offset_no_colon() -> None:
+    """Regex fallback должен корректно парсить +0300, не считая его UTC."""
+    from reminders import _parse_offset
+    assert _parse_offset("+0300") == timezone(timedelta(hours=3))
+    assert _parse_offset("-0530") == timezone(-timedelta(hours=5, minutes=30))
+    assert _parse_offset("+03:00") == timezone(timedelta(hours=3))
+    assert _parse_offset("Z") == timezone.utc
+    assert _parse_offset("") is None
+    assert _parse_offset("garbage") is None
 
 
 def test_ical_export_basic() -> None:
