@@ -91,3 +91,35 @@ def test_forget_all(db):
     _add(db, 1, "B", "bbb")
     assert db.delete_all(1) == 2
     assert db.list_notes(1) == []
+
+
+def test_update_note_title(db):
+    db.upsert_user(1, None, None, None)
+    nid = _add(db, 1, "Старый", "txt")
+    assert db.update_note_title(nid, 1, "Новый") is True
+    note = db.get_note(nid, 1)
+    assert note.title == "Новый"
+    assert note.summary["title"] == "Новый"
+    # foreign user — no-op
+    assert db.update_note_title(nid, 2, "Чужой") is False
+
+
+def test_update_note_summary_field(db):
+    db.upsert_user(1, None, None, None)
+    nid = _add(db, 1, "x", "txt")
+    assert db.update_note_summary_field(nid, 1, "category", "Работа") is True
+    assert db.get_note(nid, 1).summary["category"] == "Работа"
+    assert db.update_note_summary_field(nid, 1, "tags", ["a", "b"]) is True
+    assert db.get_note(nid, 1).summary["tags"] == ["a", "b"]
+
+
+def test_update_reminder_text_and_time(db):
+    db.upsert_user(1, None, None, None)
+    rid = db.add_reminder(user_id=1, fire_at=10**10, advance_minutes=5, text="старый", source_note_id=None)
+    assert db.update_reminder_text(rid, 1, "новый") is True
+    assert db.get_reminder(rid, 1).text == "новый"
+    assert db.update_reminder_fire_at(rid, 1, 10**10 + 100) is True
+    assert db.get_reminder(rid, 1).fire_at == 10**10 + 100
+    # cancelled — нельзя менять
+    db.cancel_reminder(rid, 1)
+    assert db.update_reminder_text(rid, 1, "после отмены") is False

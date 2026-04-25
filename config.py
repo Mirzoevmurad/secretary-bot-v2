@@ -18,6 +18,8 @@ class Config:
     default_lang: str  # "ru" | "en" | "auto"
     max_audio_mb: int
     audio_dir: Path
+    tz: str  # IANA-имя часового пояса (Europe/Moscow и т.п.) — для напоминаний и LLM-контекста
+    default_advance_minutes: int  # за сколько минут предупреждать по умолчанию
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -57,6 +59,8 @@ class Config:
             default_lang=os.getenv("DEFAULT_LANG", "auto").lower(),
             max_audio_mb=int(os.getenv("MAX_AUDIO_MB", "25")),
             audio_dir=audio_dir,
+            tz=os.getenv("TZ_NAME", "Europe/Moscow"),
+            default_advance_minutes=int(os.getenv("DEFAULT_ADVANCE_MINUTES", "5")),
         )
 
 
