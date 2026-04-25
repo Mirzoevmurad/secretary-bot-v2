@@ -198,7 +198,7 @@ def format_reminder_fire(reminder: Reminder, tz_name: str | None = None) -> str:
     )
 
 
-def format_list(notes: list[Note]) -> str:
+def format_list(notes: list[Note], tz_name: str | None = None) -> str:
     if not notes:
         return "📭 Заметок пока нет. Пришлите голосовое — я обработаю."
     lines = ["🗂 <b>Последние заметки</b>:"]
@@ -206,21 +206,21 @@ def format_list(notes: list[Note]) -> str:
         emoji = fmt_category_emoji(n.summary.get("category", "Другое"))
         title = n.summary.get("title") or n.transcript[:50]
         lines.append(
-            f"{emoji} <b>#{n.note_id}</b> · {esc(fmt_created_at(n.created_at))} · {esc(title)}"
+            f"{emoji} <b>#{n.note_id}</b> · {esc(fmt_created_at(n.created_at, tz_name))} · {esc(title)}"
         )
     lines.append("")
     lines.append("Открыть: /get_&lt;id&gt;  ·  Удалить: /delete_&lt;id&gt;")
     return "\n".join(lines)
 
 
-def format_search(notes: list[Note], query: str) -> str:
+def format_search(notes: list[Note], query: str, tz_name: str | None = None) -> str:
     if not notes:
         return f"🔍 Ничего не нашёл по запросу «{esc(query)}»."
     lines = [f"🔍 Нашёл {len(notes)} заметок по «{esc(query)}»:"]
     for n in notes:
         title = n.summary.get("title") or n.transcript[:50]
         lines.append(
-            f"• <b>#{n.note_id}</b> · {esc(fmt_created_at(n.created_at))} · {esc(title)}"
+            f"• <b>#{n.note_id}</b> · {esc(fmt_created_at(n.created_at, tz_name))} · {esc(title)}"
         )
     return "\n".join(lines)
 
@@ -234,7 +234,7 @@ def format_transcript(note: Note) -> str:
     )
 
 
-def format_stats(stats: dict) -> str:
+def format_stats(stats: dict, tz_name: str | None = None) -> str:
     total = stats.get("total", 0)
     secs = stats.get("total_seconds", 0.0)
     lines = [
@@ -243,9 +243,9 @@ def format_stats(stats: dict) -> str:
         f"• Суммарная длительность: <b>{fmt_duration(secs)}</b>",
     ]
     if stats.get("first_at"):
-        lines.append(f"• Первая: {fmt_created_at(stats['first_at'])}")
+        lines.append(f"• Первая: {fmt_created_at(stats['first_at'], tz_name)}")
     if stats.get("last_at"):
-        lines.append(f"• Последняя: {fmt_created_at(stats['last_at'])}")
+        lines.append(f"• Последняя: {fmt_created_at(stats['last_at'], tz_name)}")
     return "\n".join(lines)
 
 

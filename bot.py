@@ -212,9 +212,10 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if args and args[0].isdigit():
         limit = min(int(args[0]), 50)
     db: Database = context.bot_data["db"]
+    cfg: Config = context.bot_data["cfg"]
     notes = db.list_notes(update.effective_user.id, limit=limit)
     markup = kb.note_list_kb([n.note_id for n in notes]) if notes else None
-    await update.effective_message.reply_html(fmt.format_list(notes), reply_markup=markup)
+    await update.effective_message.reply_html(fmt.format_list(notes, cfg.tz), reply_markup=markup)
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -225,18 +226,20 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not q:
         await update.effective_message.reply_text("Использование: /search <запрос>")
         return
+    cfg: Config = context.bot_data["cfg"]
     db: Database = context.bot_data["db"]
     notes = db.search(update.effective_user.id, q, limit=10)
-    await update.effective_message.reply_html(fmt.format_search(notes, q))
+    await update.effective_message.reply_html(fmt.format_search(notes, q, cfg.tz))
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(context, update.effective_user.id):
         await _deny(update)
         return
+    cfg: Config = context.bot_data["cfg"]
     db: Database = context.bot_data["db"]
     s = db.stats(update.effective_user.id)
-    await update.effective_message.reply_html(fmt.format_stats(s))
+    await update.effective_message.reply_html(fmt.format_stats(s, cfg.tz))
 
 
 async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -435,7 +438,10 @@ async def _ask_for_edit(
     prompt_text = _FIELD_PROMPTS.get(field, "Пришлите новое значение")
     prompt = await context.bot.send_message(
         chat_id=chat_id,
-        text=f"✏️ {prompt_text}\n\n<i>(ответьте на это сообщение — ИЛИ пришлите следующим сообщением)</i>",
+        text=(
+            f"✏️ {prompt_text}\n\n"
+            "<i>Можно ответить текстом или голосовым 🎤 — следующее сообщение применится.</i>"
+        ),
         parse_mode=ParseMode.HTML,
         reply_markup=ForceReply(selective=True, input_field_placeholder="новое значение…"),
     )
@@ -575,6 +581,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     parts = data.split(":")
+    if len(parts) < 2:
+        await q.answer("Неизвестное действие.")
+        return
     # n:e:title:42 / n:e:cat:42 / n:e:tags:42
     if parts[0] == "n" and parts[1] == "e" and len(parts) == 4:
         await q.answer()
@@ -720,6 +729,16 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             saved.write_bytes(src.read_bytes())
             audio_path_saved = str(saved)
 
+    # Если ждём ответ на edit-запрос — голос трактуется как ответ.
+    pending = context.user_data.get("pending_edit") if context.user_data is not None else None
+    if pending and transcript.strip():
+        try:
+            await placeholder.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        await _apply_pending_edit(update, context, pending, transcript)
+        return
+
     # --- LLM + save + reminders ---------------------------------------
     await _process_summary(
         update,
@@ -799,6 +818,33 @@ async def _process_summary(
     )
     for r in scheduled:
         _schedule_reminder(context.application, r)
+
+    # Reminder-only режим: пользователь сказал «напомни в X встретиться с Y» —
+    # развёрнутое саммари не нужно, шлём только короткое подтверждение
+    # с inline-кнопками. Заметка всё равно сохраняется в БД (доступна через /list,
+    # /search, /get_N) — просто не выводим её визуально.
+    if summary.is_reminder_only and scheduled:
+        await placeholder.delete()
+        for r in scheduled:
+            advance_part = (
+                f" (с уведомлением за {r.advance_minutes} мин)"
+                if r.advance_minutes > 0 else ""
+            )
+            await context.bot.send_message(
+                chat_id=msg.chat_id,
+                text=(
+                    f"✅ Напоминание #{r.reminder_id} создано.\n"
+                    f"⏰ <b>{fmt.fmt_fire_at(r.fire_at, cfg.tz)}</b>{advance_part}\n"
+                    f"📝 {fmt.esc(r.text)}"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb.reminder_actions_kb(r.reminder_id),
+            )
+        logger.info(
+            "reminder-only note #%d for user %d: source=%s, reminders=%d",
+            note_id, user.id, source, len(scheduled),
+        )
+        return
 
     text = fmt.format_note(note, tz_name=cfg.tz, scheduled_reminders=scheduled)
     chunks = _split_for_telegram(text, limit=3900)
