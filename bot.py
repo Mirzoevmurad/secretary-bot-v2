@@ -54,33 +54,91 @@ async def _deny(update: Update) -> None:
 
 
 def _split_for_telegram(text: str, limit: int = 3900) -> list[str]:
-    """Делит сообщение по двойным переводам строк, чтобы не превышать лимит Telegram (4096)."""
+    """Делит длинное HTML-сообщение на куски ≤ limit символов, не ломая HTML-тэги.
+
+    `format_note` использует только теги `<b>` и `<i>`, и они никогда не пересекают
+    `\\n`. Поэтому любая граница `\\n\\n` / `\\n` безопасна. Сначала пытаемся резать
+    по абзацам, потом по строкам, потом по предложениям/словам.
+    """
     if len(text) <= limit:
         return [text]
-    parts: list[str] = []
-    buf: list[str] = []
-    cur = 0
-    for block in text.split("\n\n"):
-        block_len = len(block) + 2
-        if cur + block_len > limit and buf:
-            parts.append("\n\n".join(buf))
-            buf = [block]
-            cur = block_len
-        else:
-            buf.append(block)
-            cur += block_len
-    if buf:
-        parts.append("\n\n".join(buf))
-    # на случай, если один блок сам по себе длиннее limit — режем по строкам
-    out: list[str] = []
-    for p in parts:
-        if len(p) <= limit:
-            out.append(p)
+
+    def _group(items: list[str], sep: str) -> list[str]:
+        """Группирует элементы в строки ≤ limit, сохраняя `sep` между ними."""
+        out: list[str] = []
+        buf: list[str] = []
+        cur = 0
+        sep_len = len(sep)
+        for it in items:
+            it_len = len(it) + (sep_len if buf else 0)
+            if cur + it_len > limit and buf:
+                out.append(sep.join(buf))
+                buf = [it]
+                cur = len(it)
+            else:
+                buf.append(it)
+                cur += it_len
+        if buf:
+            out.append(sep.join(buf))
+        return out
+
+    # Шаг 1: пытаемся резать по абзацам (\n\n).
+    chunks = _group(text.split("\n\n"), "\n\n")
+
+    # Шаг 2: если какой-то кусок всё ещё длиннее limit — режем его по строкам.
+    refined: list[str] = []
+    for c in chunks:
+        if len(c) <= limit:
+            refined.append(c)
             continue
-        # hard split
-        for i in range(0, len(p), limit):
-            out.append(p[i:i + limit])
-    return out
+        refined.extend(_group(c.split("\n"), "\n"))
+    chunks = refined
+
+    # Шаг 3: если строка длиннее limit — режем по предложениям, потом по словам.
+    refined = []
+    for c in chunks:
+        if len(c) <= limit:
+            refined.append(c)
+            continue
+        sentences = c.replace(". ", ".\x00").split("\x00")
+        sub = _group(sentences, "")
+        # Шаг 3b: одно предложение длиннее limit — режем по словам.
+        sub_refined: list[str] = []
+        for s in sub:
+            if len(s) <= limit:
+                sub_refined.append(s)
+                continue
+            sub_refined.extend(_group(s.split(" "), " "))
+        refined.extend(sub_refined)
+    chunks = refined
+
+    # Финальная страховка: остался кусок > limit (нет ни пробелов, ни границ).
+    # Такого не должно быть с естественным текстом, но если случилось — режем
+    # тупо по символам и шлём как plain text (без HTML), чтобы не разорвать тэг.
+    return chunks
+
+
+def _has_unsafe_chunk(chunks: list[str], limit: int = 3900) -> bool:
+    return any(len(c) > limit for c in chunks)
+
+
+async def _reply_long_html(msg, text: str, limit: int = 3900) -> None:
+    """Отправляет длинный HTML-текст одним или несколькими сообщениями.
+
+    Если все куски в безопасных границах — шлём с parse_mode=HTML.
+    Если нашёлся атомарный кусок > limit (крайне маловероятно) — режем посимвольно
+    и шлём как plain text, чтобы Telegram не отверг разорванный тэг.
+    """
+    chunks = _split_for_telegram(text, limit=limit)
+    safe = not _has_unsafe_chunk(chunks, limit)
+    if safe:
+        for chunk in chunks:
+            await msg.reply_html(chunk, disable_web_page_preview=True)
+        return
+    # fallback: plain text
+    plain = text  # без перевода в plain — Telegram сам отрисует тэги как символы
+    for i in range(0, len(plain), limit):
+        await msg.reply_text(plain[i:i + limit], disable_web_page_preview=True)
 
 
 def _convert_to_wav(src: Path, dst: Path) -> None:
@@ -123,7 +181,7 @@ async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if note is None:
         await update.effective_message.reply_text("Заметок пока нет.")
         return
-    await update.effective_message.reply_html(fmt.format_note(note))
+    await _reply_long_html(update.effective_message, fmt.format_note(note))
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -205,7 +263,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if note is None:
             await update.effective_message.reply_text(f"Заметка #{note_id} не найдена.")
             return
-        await update.effective_message.reply_html(fmt.format_transcript(note))
+        await _reply_long_html(update.effective_message, fmt.format_transcript(note))
         return
     m = _DELETE_RE.match(txt)
     if m:
@@ -324,15 +382,11 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         assert note is not None
 
     text = fmt.format_note(note)
-    # Telegram message limit is 4096 chars; чтобы не упасть на длинных заметках, режем по разделителям
+    # Telegram message limit = 4096 символов. Если влезает — редактируем placeholder; иначе редактируем
+    # placeholder первым куском и шлём остальные доп. сообщениями.
     chunks = _split_for_telegram(text, limit=3900)
-    if len(chunks) == 1:
-        await placeholder.edit_text(
-            chunks[0],
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    else:
+    safe = not _has_unsafe_chunk(chunks, 3900)
+    if safe:
         await placeholder.edit_text(
             chunks[0],
             parse_mode=ParseMode.HTML,
@@ -343,6 +397,15 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id=msg.chat_id,
                 text=chunk,
                 parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+    else:
+        # очень редкий путь: атомарный кусок без границ — режем посимвольно как plain text
+        await placeholder.edit_text(text[:3900], disable_web_page_preview=True)
+        for i in range(3900, len(text), 3900):
+            await context.bot.send_message(
+                chat_id=msg.chat_id,
+                text=text[i:i + 3900],
                 disable_web_page_preview=True,
             )
     logger.info(
