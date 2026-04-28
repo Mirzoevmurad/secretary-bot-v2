@@ -659,7 +659,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             reply_markup=kb.confirm_delete_note_kb(int(parts[2])),
         )
         return
-    # n:polish:42 — полировка транскрипта LLM
+    # n:polish:42 — полировка транскрипта LLM (заменяет заметку полированным текстом)
     if parts[0] == "n" and parts[1] == "polish" and len(parts) == 3:
         note_id = int(parts[2])
         note = db.get_note(note_id, user_id)
@@ -667,7 +667,39 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await q.answer("Заметка не найдена.", show_alert=True)
             return
         await q.answer("Полирую…")
-        await _send_polished(q.message, context, note)
+        llm: GroqLLM = context.bot_data["llm"]
+        try:
+            polished = await llm.polish(note.transcript)
+        except LLMError as e:
+            await q.message.reply_text(f"⚠️ Не смог полировать: {e}")
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.exception("polish failed")
+            await q.message.reply_text(f"⚠️ Ошибка полировки ({type(e).__name__}).")
+            return
+        # удаляем оригинальную заметку из БД и заменяем сообщение полированным текстом.
+        db.delete_note(note_id, user_id)
+        header = f"<b>📝 Полированный текст</b>\n\n"
+        body = fmt.esc(polished)
+        text = header + body
+        try:
+            if len(text) <= 3900:
+                await q.edit_message_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            else:
+                # длинный текст не влезает в одно сообщение → удаляем оригинал и шлём новый(е)
+                try:
+                    await q.message.delete()
+                except Exception:  # noqa: BLE001
+                    pass
+                await _reply_long_html(q.message, text)
+        except Exception:  # noqa: BLE001
+            # edit может упасть, если сообщение слишком старое или содержит документ —
+            # тогда удалим оригинал и пришлём новое.
+            try:
+                await q.message.delete()
+            except Exception:  # noqa: BLE001
+                pass
+            await _reply_long_html(q.message, text)
         return
     # n:del_yes:42
     if parts[0] == "n" and parts[1] == "del_yes" and len(parts) == 3:
