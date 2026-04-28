@@ -306,6 +306,53 @@ async def cmd_export_ical(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+async def _send_polished(msg, context: ContextTypes.DEFAULT_TYPE, note: Note) -> None:
+    """Полирует транскрипт заметки через LLM и отправляет в чат."""
+    llm: GroqLLM = context.bot_data["llm"]
+    placeholder = await msg.reply_text("📝 Полирую…")
+    try:
+        polished = await llm.polish(note.transcript)
+    except LLMError as e:
+        await placeholder.edit_text(f"⚠️ Не смог полировать: {e}")
+        return
+    except Exception as e:  # noqa: BLE001
+        logger.exception("polish failed")
+        await placeholder.edit_text(f"⚠️ Ошибка полировки ({type(e).__name__}).")
+        return
+    try:
+        await placeholder.delete()
+    except Exception:  # noqa: BLE001
+        pass
+    header = f"<b>📝 Полированный текст #{note.note_id}</b>\n\n"
+    body = fmt.esc(polished)
+    await _reply_long_html(msg, header + body)
+
+
+async def cmd_txt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/txt` — полирует транскрипт последней заметки.
+    `/txt N` — полирует заметку #N.
+    """
+    if not _is_allowed(context, update.effective_user.id):
+        await _deny(update)
+        return
+    db: Database = context.bot_data["db"]
+    args = context.args or []
+    note: Note | None
+    if args and args[0].isdigit():
+        note = db.get_note(int(args[0]), update.effective_user.id)
+        if note is None:
+            await update.effective_message.reply_text(f"Заметка #{args[0]} не найдена.")
+            return
+    else:
+        note = db.last_note(update.effective_user.id)
+        if note is None:
+            await update.effective_message.reply_text(
+                "Заметок пока нет — пришлите голосовое или текст."
+            )
+            return
+    await _send_polished(update.effective_message, context, note)
+
+
 # --- /get_N и /delete_N как динамические команды -----------------------
 
 
@@ -611,6 +658,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             text=f"🗑 Удалить заметку #{parts[2]}?",
             reply_markup=kb.confirm_delete_note_kb(int(parts[2])),
         )
+        return
+    # n:polish:42 — полировка транскрипта LLM
+    if parts[0] == "n" and parts[1] == "polish" and len(parts) == 3:
+        note_id = int(parts[2])
+        note = db.get_note(note_id, user_id)
+        if note is None:
+            await q.answer("Заметка не найдена.", show_alert=True)
+            return
+        await q.answer("Полирую…")
+        await _send_polished(q.message, context, note)
         return
     # n:del_yes:42
     if parts[0] == "n" and parts[1] == "del_yes" and len(parts) == 3:
@@ -1064,6 +1121,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("forget_all", cmd_forget_all))
     app.add_handler(CommandHandler("reminders", cmd_reminders))
     app.add_handler(CommandHandler("export_ical", cmd_export_ical))
+    app.add_handler(CommandHandler("txt", cmd_txt))
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
@@ -1082,6 +1140,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("last", "📄 Последняя заметка"),
     ("list", "📚 Список последних заметок"),
     ("search", "🔍 Поиск по заметкам"),
+    ("txt", "📝 Полировать последнее голосовое"),
     ("reminders", "⏰ Активные напоминания"),
     ("export_ical", "📅 Экспорт напоминаний в .ics"),
     ("stats", "📊 Статистика"),

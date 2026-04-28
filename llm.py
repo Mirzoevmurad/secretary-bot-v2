@@ -87,6 +87,23 @@ class Summary(BaseModel):
     is_reminder_only: bool = False
 
 
+POLISH_SYSTEM_PROMPT = """Ты получаешь транскрипт голосового сообщения и переписываешь его так:
+— исправляешь все ошибки, кавычки, пунктуацию, падежи;
+— делаешь текст структурированным (короткие абзацы, логические переходы);
+— соблюдаешь правила русского языка (тире, запятые, буква ё);
+— убираешь слова-паразиты и повторы;
+— сохраняешь живой, человеческий стиль (НЕ канцелярит!);
+— учитываешь, что автор работает в IT: технические термины не переделываешь, код не трогаешь, англицизмы оставляешь уместными.
+
+Результат: чистый, грамотный, читаемый текст, который звучит как голос автора, но по-русски идеально.
+
+Жёсткие правила:
+- НЕ добавляй своих комментариев, преамбул, выводов или метатекста («Вот переработанный текст:», «Надеюсь, помогло»). Возвращай ТОЛЬКО сам обработанный текст.
+- НЕ переводи на английский, даже если транскрипт целиком на английском — в этом случае только мягко правь грамматику и оставь язык исходным.
+- НЕ выдумывай детали, которых не было в транскрипте.
+- Сохраняй смысл, имена, числа, даты, термины и ссылки — точно как у автора."""
+
+
 class LLMError(Exception):
     pass
 
@@ -95,6 +112,27 @@ class GroqLLM:
     def __init__(self, api_key: str, model: str = "llama-3.3-70b-versatile") -> None:
         self._client = Groq(api_key=api_key)
         self._model = model
+
+    async def polish(self, transcript: str) -> str:
+        """Полирует транскрипт по правилам POLISH_SYSTEM_PROMPT."""
+        if not transcript.strip():
+            raise LLMError("Пустой транскрипт")
+        return await asyncio.to_thread(self._polish_sync, transcript)
+
+    def _polish_sync(self, transcript: str) -> str:
+        completion = self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": POLISH_SYSTEM_PROMPT},
+                {"role": "user", "content": transcript},
+            ],
+            temperature=0.3,
+            max_tokens=4000,
+        )
+        text = (completion.choices[0].message.content or "").strip()
+        if not text:
+            raise LLMError("LLM вернул пустой результат")
+        return text
 
     async def structure(self, transcript: str, *, now_context: str | None = None) -> Summary:
         """Структурирует текст. now_context — пред-блок с текущим временем и таймзоной автора,

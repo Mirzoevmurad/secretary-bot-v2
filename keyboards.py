@@ -7,6 +7,7 @@ Callback-data формат: короткие префиксы (Telegram limit = 
 - n:del:42           — ask to delete note (показать confirm)
 - n:open:42          — open note detail (из списка)
 - n:del_yes:42       — confirm delete
+- n:polish:42        — полировать транскрипт LLM
 - r:e:time:5         — edit reminder fire_at
 - r:e:text:5         — edit reminder text
 - r:cancel:5         — ask to cancel reminder (confirm)
@@ -28,6 +29,9 @@ def note_actions_kb(note_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("# Теги", callback_data=f"n:e:tags:{note_id}"),
+                InlineKeyboardButton("📝 Полировать", callback_data=f"n:polish:{note_id}"),
+            ],
+            [
                 InlineKeyboardButton("🗑 Удалить", callback_data=f"n:del:{note_id}"),
             ],
         ]
