@@ -677,14 +677,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             logger.exception("polish failed")
             await q.message.reply_text(f"⚠️ Ошибка полировки ({type(e).__name__}).")
             return
-        # удаляем оригинальную заметку из БД и заменяем сообщение полированным текстом.
-        db.delete_note(note_id, user_id)
-        header = f"<b>📝 Полированный текст</b>\n\n"
+        # сначала доставляем полированный текст, и только при успехе удаляем заметку из БД,
+        # чтобы при сбое отправки данные не пропали.
+        header = "<b>📝 Полированный текст</b>\n\n"
         body = fmt.esc(polished)
         text = header + body
+        delivered = False
         try:
             if len(text) <= 3900:
-                await q.edit_message_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                await q.edit_message_text(
+                    text, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+                )
+                delivered = True
             else:
                 # длинный текст не влезает в одно сообщение → удаляем оригинал и шлём новый(е)
                 try:
@@ -692,6 +696,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 except Exception:  # noqa: BLE001
                     pass
                 await _reply_long_html(q.message, text)
+                delivered = True
         except Exception:  # noqa: BLE001
             # edit может упасть, если сообщение слишком старое или содержит документ —
             # тогда удалим оригинал и пришлём новое.
@@ -699,7 +704,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await q.message.delete()
             except Exception:  # noqa: BLE001
                 pass
-            await _reply_long_html(q.message, text)
+            try:
+                await _reply_long_html(q.message, text)
+                delivered = True
+            except Exception:  # noqa: BLE001
+                logger.exception("failed to deliver polished text; keeping note in DB")
+        if delivered:
+            db.delete_note(note_id, user_id)
         return
     # n:del_yes:42
     if parts[0] == "n" and parts[1] == "del_yes" and len(parts) == 3:
