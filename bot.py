@@ -894,17 +894,21 @@ async def _process_summary(
         )
         return
 
-    # Решаем, сохранять ли заметку. По умолчанию — НЕТ. Сохраняем только если:
-    #   1) LLM решил, что это запись/структурный материал (should_save_note=true);
-    #   2) LLM пометил это как чистое напоминание (is_reminder_only=true) — заметку
-    #      сохраняем, но визуально не показываем (нужно для /list / поиска);
-    #   3) есть напоминание (нужно как контекст для напоминания).
-    save_note = bool(
+    # Решение разделено на ДВА флага.
+    #   save_to_db — пишем заметку в БД (нужно если есть напоминания, чистый
+    #     reminder-only кейс, ИЛИ автор явно хотел сохранить).
+    #   show_full_summary — показываем структурированный конспект (только когда
+    #     автор явно хотел заметку: should_save_note=true). Если есть напоминание
+    #     БЕЗ should_save_note и БЕЗ is_reminder_only — заметка сохранится в БД
+    #     для контекста, но в чате будет полированный текст + кнопки напоминания
+    #     (а не развёрнутый конспект).
+    save_to_db = bool(
         summary.should_save_note or summary.is_reminder_only or summary.reminders
     )
+    show_full_summary = bool(summary.should_save_note)
     note_id: int | None = None
     note: Note | None = None
-    if save_note:
+    if save_to_db:
         note_id = db.add_note(
             user_id=user.id,
             transcript=transcript,
@@ -958,7 +962,7 @@ async def _process_summary(
         return
 
     # Ветка А — заметку сохраняем и показываем структурированный вид.
-    if save_note and note is not None:
+    if show_full_summary and note is not None:
         text = fmt.format_note(note, tz_name=cfg.tz, scheduled_reminders=scheduled)
         chunks = _split_for_telegram(text, limit=3900)
         safe = not _has_unsafe_chunk(chunks, 3900)
@@ -997,7 +1001,9 @@ async def _process_summary(
         )
         return
 
-    # Ветка Б — заметку НЕ сохраняем. Возвращаем отполированный текст реплики.
+    # Ветка Б — заметку не показываем как конспект. Возвращаем отполированный
+    # текст реплики. Если есть напоминания, добавляем для каждого отдельное
+    # сообщение с кнопками управления (как в ветке А).
     try:
         polished = await llm.polish(transcript)
     except Exception as e:  # noqa: BLE001
@@ -1026,9 +1032,24 @@ async def _process_summary(
                 chat_id=msg.chat_id, text=piece,
                 parse_mode=None, disable_web_page_preview=True,
             )
+    for r in scheduled:
+        advance_part = (
+            f" (с уведомлением за {r.advance_minutes} мин)"
+            if r.advance_minutes > 0 else ""
+        )
+        await context.bot.send_message(
+            chat_id=msg.chat_id,
+            text=(
+                f"✅ Напоминание #{r.reminder_id} создано.\n"
+                f"⏰ <b>{fmt.fmt_fire_at(r.fire_at, cfg.tz)}</b>{advance_part}\n"
+                f"📝 {fmt.esc(r.text)}"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb.reminder_actions_kb(r.reminder_id),
+        )
     logger.info(
-        "polish-only response for user %d: source=%s, reminders=%d",
-        user.id, source, len(scheduled),
+        "polish response for user %d: source=%s, reminders=%d, saved_for_context=%s",
+        user.id, source, len(scheduled), save_to_db,
     )
 
 
