@@ -12,11 +12,14 @@ Callback-data формат: короткие префиксы (Telegram limit = 
 - r:e:text:5         — edit reminder text
 - r:cancel:5         — ask to cancel reminder (confirm)
 - r:cancel_yes:5     — confirm cancel
+- x:tr:<token>       — translate cached polished text
+- x:edit:<token>     — edit cached polished text and translate
+- x:back:<token>     — restore original (после перевода)
 - nop                — кнопка-разделитель / отмена пришедшего prompt
 """
 from __future__ import annotations
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
 
 
 def note_actions_kb(note_id: int) -> InlineKeyboardMarkup:
@@ -95,3 +98,78 @@ def confirm_cancel_reminder_kb(reminder_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+# ---- Полировка / перевод -------------------------------------------------
+
+# Telegram CopyTextButton ограничивает длину поля text 256 символами. Если
+# полированный текст длиннее — кнопку «Копировать» либо не показываем, либо
+# вешаем на сокращённый фрагмент. Мы выбираем простой путь: при длине
+# больше лимита — кнопка «Копировать» не строится; пользователь копирует
+# выделением вручную.
+COPY_BUTTON_LIMIT = 256
+
+
+def _copy_button(text: str, label: str) -> InlineKeyboardButton | None:
+    if not text or len(text) > COPY_BUTTON_LIMIT:
+        return None
+    return InlineKeyboardButton(label, copy_text=CopyTextButton(text=text))
+
+
+def polish_actions_kb(token: str, polished_text: str) -> InlineKeyboardMarkup:
+    """Кнопки под полированным ответом (без сохранения как заметки).
+    Содержит:
+      - 📋 Скопировать (CopyTextButton с самим текстом, по тапу — clipboard);
+      - 🌍 Перевести (RU↔EN, направление автоматическое).
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    copy_btn = _copy_button(polished_text, "📋 Скопировать")
+    if copy_btn is not None:
+        rows.append([copy_btn])
+    rows.append([
+        InlineKeyboardButton("🌍 Перевести", callback_data=f"x:tr:{token}"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def translate_actions_kb(
+    token: str, source_text: str, translated_text: str,
+) -> InlineKeyboardMarkup:
+    """Под текстом, который бот вывел как «оригинал» в режиме перевода.
+    Содержит:
+      - 📋 Скопировать оригинал
+      - 🌍 Перевести
+      - ✏️ Исправить и перевести (опционально, через состояние)
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    copy_btn = _copy_button(source_text, "📋 Скопировать оригинал")
+    if copy_btn is not None:
+        rows.append([copy_btn])
+    if translated_text:
+        # уже переведено — показываем кнопку «копировать перевод» и «вернуть оригинал»
+        copy_tr = _copy_button(translated_text, "📋 Скопировать перевод")
+        if copy_tr is not None:
+            rows.append([copy_tr])
+    rows.append([
+        InlineKeyboardButton("🌍 Перевести", callback_data=f"x:tr:{token}"),
+        InlineKeyboardButton("✏️ Исправить", callback_data=f"x:edit:{token}"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def translated_view_kb(
+    token: str, source_text: str, translated_text: str,
+) -> InlineKeyboardMarkup:
+    """Под выведённым переводом."""
+    rows: list[list[InlineKeyboardButton]] = []
+    copy_btn = _copy_button(translated_text, "📋 Скопировать перевод")
+    if copy_btn is not None:
+        rows.append([copy_btn])
+    copy_src = _copy_button(source_text, "📋 Скопировать оригинал")
+    if copy_src is not None:
+        rows.append([copy_src])
+    rows.append([
+        InlineKeyboardButton("🔁 Показать оригинал", callback_data=f"x:back:{token}"),
+        InlineKeyboardButton("✏️ Исправить", callback_data=f"x:edit:{token}"),
+    ])
+    return InlineKeyboardMarkup(rows)

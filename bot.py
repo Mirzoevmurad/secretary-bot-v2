@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import secrets as _secrets
 import subprocess
 import tempfile
 import time
@@ -153,6 +154,141 @@ async def _reply_long_html(msg, text: str, limit: int = 3900, reply_markup=None)
         if i == len(pieces) - 1 and reply_markup is not None:
             kw["reply_markup"] = reply_markup
         await msg.reply_text(piece, **kw)
+
+
+# ---- translate cache ---------------------------------------------------
+#
+# Полированный текст хранится в bot_data["xlate_cache"] под коротким токеном
+# (8 hex символов), чтобы кнопка callback_data умещалась в 64 байта Telegram-а.
+# Это нужно для:
+#   - кнопки «🌍 Перевести» под полированным сообщением,
+#   - «✏️ Исправить» — пользователь правит исходник, потом мы переводим,
+#   - «🔁 Показать оригинал» — переключение между оригиналом и переводом.
+# Кэш ограничен ~256 записями (LRU): хранится in-memory, при рестарте бота
+# теряется — это нормально, токены живут только пока чат активен.
+
+_XLATE_CACHE_LIMIT = 256
+_XLATE_HISTORY_KEY = "xlate_cache"
+_XLATE_HISTORY_ORDER = "xlate_cache_order"
+
+
+def _xlate_cache_get(context: ContextTypes.DEFAULT_TYPE) -> dict[str, dict]:
+    cache = context.bot_data.get(_XLATE_HISTORY_KEY)
+    if cache is None:
+        cache = {}
+        context.bot_data[_XLATE_HISTORY_KEY] = cache
+    return cache
+
+
+def _xlate_cache_put(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: int,
+    source_text: str,
+    translated_text: str | None = None,
+) -> str:
+    """Сохраняет исходник + (опц.) перевод в bot_data, возвращает короткий токен."""
+    cache = _xlate_cache_get(context)
+    order: list[str] = context.bot_data.setdefault(_XLATE_HISTORY_ORDER, [])
+    while len(order) >= _XLATE_CACHE_LIMIT:
+        old = order.pop(0)
+        cache.pop(old, None)
+    token = _secrets.token_hex(4)  # 8 hex chars
+    cache[token] = {
+        "user_id": user_id,
+        "src": source_text,
+        "translated": translated_text or "",
+    }
+    order.append(token)
+    return token
+
+
+def _xlate_cache_update(
+    context: ContextTypes.DEFAULT_TYPE,
+    token: str,
+    *,
+    src: str | None = None,
+    translated: str | None = None,
+) -> dict | None:
+    cache = _xlate_cache_get(context)
+    entry = cache.get(token)
+    if entry is None:
+        return None
+    if src is not None:
+        entry["src"] = src
+    if translated is not None:
+        entry["translated"] = translated
+    return entry
+
+
+def _detect_target_lang(source_text: str) -> str:
+    """Простое правило для RU↔EN: если в тексте есть кириллица — переводим на en,
+    иначе на ru. Поддерживаем только две стороны."""
+    for ch in source_text:
+        # u0400-u04FF — кириллический блок
+        if "\u0400" <= ch <= "\u04FF":
+            return "en"
+    return "ru"
+
+
+async def _send_body_with_actions(
+    msg,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    placeholder=None,
+    header: str,
+    body: str,
+    reply_markup,
+) -> None:
+    """Шлёт «полированный текст» как два сообщения:
+      1) header (с эмодзи / стилем) — информативная плашка;
+      2) body — ОТДЕЛЬНОЕ сообщение, чтобы long-press → Copy копировал
+         ТОЛЬКО body без header.
+    К body прикрепляется reply_markup (кнопки копирования / перевода).
+
+    Если передан placeholder — он используется под header, чтобы не плодить
+    лишних сообщений; иначе header шлётся новым сообщением.
+    """
+    chat_id = msg.chat_id
+    # 1) header
+    if placeholder is not None:
+        try:
+            await placeholder.edit_text(
+                header, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            )
+        except Exception:  # noqa: BLE001
+            try:
+                await placeholder.delete()
+            except Exception:  # noqa: BLE001
+                pass
+            await context.bot.send_message(
+                chat_id=chat_id, text=header,
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id, text=header,
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        )
+    # 2) body. Если влезает в одно сообщение — шлём с кнопками; иначе режем
+    # и кнопки прикрепляем к ПОСЛЕДНЕМУ куску.
+    body_chunks = _split_for_telegram(body, limit=3900)
+    safe = not _has_unsafe_chunk(body_chunks, 3900)
+    if not safe:
+        body_chunks = [body[i:i + 3900] for i in range(0, len(body), 3900)]
+    for i, chunk in enumerate(body_chunks):
+        kw = {"disable_web_page_preview": True}
+        if i == len(body_chunks) - 1:
+            kw["reply_markup"] = reply_markup
+        if safe:
+            await context.bot.send_message(
+                chat_id=chat_id, text=chunk,
+                parse_mode=ParseMode.HTML, **kw,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id, text=chunk, parse_mode=None, **kw,
+            )
 
 
 def _convert_to_wav(src: Path, dst: Path) -> None:
@@ -543,6 +679,43 @@ async def _apply_pending_edit(
             await update.effective_message.reply_text("Неизвестное поле.")
         return
 
+    if kind == "xlate":
+        # field хранит токен исходника в _xlate_cache
+        token = pending["field"]
+        entry = _xlate_cache_get(context).get(token)
+        if entry is None or entry.get("user_id") != user_id:
+            await update.effective_message.reply_text(
+                "Текст не найден (возможно, бот был перезапущен). Пришлите запрос на перевод заново."
+            )
+            return
+        # Обновляем исходник, переводим и показываем перевод.
+        target = _detect_target_lang(new_value)
+        _xlate_cache_update(context, token, src=new_value, translated=None)
+        llm: GroqLLM = context.bot_data["llm"]
+        try:
+            translated = await llm.translate(new_value, target)
+        except LLMError as e:
+            await update.effective_message.reply_text(f"⚠️ Не смог перевести: {e}")
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.exception("translate (after edit) failed")
+            await update.effective_message.reply_text(
+                f"⚠️ Ошибка перевода ({type(e).__name__})."
+            )
+            return
+        _xlate_cache_update(context, token, translated=translated)
+        arrow = "RU → EN" if target == "en" else "EN → RU"
+        await _send_body_with_actions(
+            update.effective_message, context,
+            placeholder=None,
+            header=f"<b>🌍 Перевод ({arrow})</b>",
+            body=fmt.esc(translated),
+            reply_markup=kb.translated_view_kb(
+                token, source_text=new_value, translated_text=translated,
+            ),
+        )
+        return
+
     if kind == "rem":
         rem = db.get_reminder(item_id, user_id)
         if rem is None:
@@ -740,6 +913,92 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             reply_markup=kb.confirm_cancel_reminder_kb(int(parts[2])),
         )
         return
+    # x:tr:<token> — перевести закэшированный исходник
+    if parts[0] == "x" and parts[1] == "tr" and len(parts) == 3:
+        token = parts[2]
+        entry = _xlate_cache_get(context).get(token)
+        if entry is None or entry.get("user_id") != user_id:
+            await q.answer("Текст не найден (бот мог быть перезапущен).", show_alert=True)
+            return
+        src = entry.get("src") or ""
+        target = _detect_target_lang(src)
+        await q.answer("Перевожу…")
+        llm: GroqLLM = context.bot_data["llm"]
+        try:
+            translated = await llm.translate(src, target)
+        except LLMError as e:
+            await q.message.reply_text(f"⚠️ Не смог перевести: {e}")
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.exception("translate failed")
+            await q.message.reply_text(f"⚠️ Ошибка перевода ({type(e).__name__}).")
+            return
+        _xlate_cache_update(context, token, translated=translated)
+        arrow = "RU → EN" if target == "en" else "EN → RU"
+        header = f"<b>🌍 Перевод ({arrow})</b>"
+        await _send_body_with_actions(
+            q.message, context,
+            placeholder=None,
+            header=header,
+            body=fmt.esc(translated),
+            reply_markup=kb.translated_view_kb(
+                token, source_text=src, translated_text=translated,
+            ),
+        )
+        return
+    # x:edit:<token> — попросить пользователя прислать исправленный текст
+    if parts[0] == "x" and parts[1] == "edit" and len(parts) == 3:
+        token = parts[2]
+        entry = _xlate_cache_get(context).get(token)
+        if entry is None or entry.get("user_id") != user_id:
+            await q.answer("Текст не найден (бот мог быть перезапущен).", show_alert=True)
+            return
+        await q.answer()
+        prompt = await context.bot.send_message(
+            chat_id=q.message.chat_id,
+            text=(
+                "✏️ Пришлите исправленный текст (голосом 🎤 или текстом). "
+                "Применю и сразу переведу."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=ForceReply(
+                selective=True, input_field_placeholder="исправленный текст…",
+            ),
+        )
+        if context.user_data is not None:
+            context.user_data["pending_edit"] = {
+                "kind": "xlate",
+                "id": 0,
+                "field": token,
+                "prompt_id": prompt.message_id,
+            }
+        return
+    # x:back:<token> — показать оригинал (после перевода)
+    if parts[0] == "x" and parts[1] == "back" and len(parts) == 3:
+        token = parts[2]
+        entry = _xlate_cache_get(context).get(token)
+        if entry is None or entry.get("user_id") != user_id:
+            await q.answer("Текст не найден.", show_alert=True)
+            return
+        src = entry.get("src") or ""
+        translated = entry.get("translated") or ""
+        await q.answer()
+        target = _detect_target_lang(src)
+        arrow = "RU → EN" if target == "en" else "EN → RU"
+        header = (
+            f"<b>🌍 Перевод ({arrow})</b>\n"
+            "<i>Это оригинал. Нажмите «🌍 Перевести» для перевода или «✏️ Исправить» для правки.</i>"
+        )
+        await _send_body_with_actions(
+            q.message, context,
+            placeholder=None,
+            header=header,
+            body=fmt.esc(src),
+            reply_markup=kb.translate_actions_kb(
+                token, source_text=src, translated_text=translated,
+            ),
+        )
+        return
     # r:cancel_yes:5
     if parts[0] == "r" and parts[1] == "cancel_yes" and len(parts) == 3:
         rid = int(parts[2])
@@ -894,6 +1153,31 @@ async def _process_summary(
         )
         return
 
+    # ---- Translate-режим. Если автор явно попросил перевод ----
+    # (LLM выставил is_translate_request=true) — пропускаем заметку,
+    # полируем оригинал и сразу выводим перевод. Параллельно создаём
+    # напоминания, если они есть.
+    if summary.is_translate_request:
+        # планируем напоминания (если в речи была дата — например, «переведи и
+        # напомни в 12 встречу»). Для translate-кейса note_id всегда None.
+        scheduled = materialize_reminders(
+            db, user.id, summary.reminders, cfg.tz,
+            cfg.default_advance_minutes, source_note_id=None,
+        )
+        for r in scheduled:
+            _schedule_reminder(context.application, r)
+        await _process_translate(
+            update, context,
+            placeholder=placeholder,
+            transcript=transcript,
+            scheduled=scheduled,
+        )
+        logger.info(
+            "translate request for user %d: source=%s, reminders=%d",
+            user.id, source, len(scheduled),
+        )
+        return
+
     # Решение разделено на ДВА флага.
     #   save_to_db — пишем заметку в БД (нужно если есть напоминания, чистый
     #     reminder-only кейс, ИЛИ автор явно хотел сохранить).
@@ -1001,37 +1285,25 @@ async def _process_summary(
         )
         return
 
-    # Ветка Б — заметку не показываем как конспект. Возвращаем отполированный
-    # текст реплики. Если есть напоминания, добавляем для каждого отдельное
-    # сообщение с кнопками управления (как в ветке А).
+    # Ветка Б — заметку как конспект не показываем. Возвращаем отполированный
+    # текст: header в одном сообщении, тело — в отдельном (чтобы long-press
+    # копировал ТОЛЬКО body без заголовка), плюс кнопка [📋 Скопировать]
+    # (CopyTextButton — single tap, если умещается в 256 символов) и
+    # [🌍 Перевести] (RU↔EN). Если есть напоминания, добавляем для каждого
+    # отдельное сообщение с кнопками управления (как в ветке А).
     try:
         polished = await llm.polish(transcript)
     except Exception as e:  # noqa: BLE001
         logger.warning("polish fallback to raw: %s", e)
         polished = transcript
-    body = fmt.esc(polished)
-    text = f"<b>📝 Полированный текст</b>\n\n{body}"
-    chunks = _split_for_telegram(text, limit=3900)
-    safe = not _has_unsafe_chunk(chunks, 3900)
-    if safe:
-        await placeholder.edit_text(
-            chunks[0], parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-        )
-        for chunk in chunks[1:]:
-            await context.bot.send_message(
-                chat_id=msg.chat_id, text=chunk,
-                parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-            )
-    else:
-        pieces = [text[i:i + 3900] for i in range(0, len(text), 3900)]
-        await placeholder.edit_text(
-            pieces[0], parse_mode=None, disable_web_page_preview=True,
-        )
-        for piece in pieces[1:]:
-            await context.bot.send_message(
-                chat_id=msg.chat_id, text=piece,
-                parse_mode=None, disable_web_page_preview=True,
-            )
+    token = _xlate_cache_put(context, user_id=user.id, source_text=polished)
+    await _send_body_with_actions(
+        msg, context,
+        placeholder=placeholder,
+        header="<b>📝 Полированный текст</b>",
+        body=fmt.esc(polished),
+        reply_markup=kb.polish_actions_kb(token, polished),
+    )
     for r in scheduled:
         advance_part = (
             f" (с уведомлением за {r.advance_minutes} мин)"
@@ -1051,6 +1323,68 @@ async def _process_summary(
         "polish response for user %d: source=%s, reminders=%d, saved_for_context=%s",
         user.id, source, len(scheduled), save_to_db,
     )
+
+
+async def _process_translate(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    placeholder,
+    transcript: str,
+    scheduled,
+) -> None:
+    """Полностью отдельный пайплайн при is_translate_request=true:
+    1) полируем оригинал (исправляем грамматику, убираем слова-паразиты);
+    2) НЕ переводим автоматически — выводим только полированный оригинал
+       плюс кнопки «📋 Скопировать оригинал», «🌍 Перевести»,
+       «✏️ Исправить» (если хочется поправить руками перед переводом).
+    Это даёт пользователю возможность убедиться, что бот распознал текст
+    правильно, перед собственно переводом.
+    """
+    cfg: Config = context.bot_data["cfg"]
+    llm: GroqLLM = context.bot_data["llm"]
+    user = update.effective_user
+    msg = update.effective_message
+
+    try:
+        polished = await llm.polish(transcript)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("polish (translate path) fallback to raw: %s", e)
+        polished = transcript
+
+    direction = _detect_target_lang(polished)
+    arrow = "RU → EN" if direction == "en" else "EN → RU"
+    token = _xlate_cache_put(context, user_id=user.id, source_text=polished)
+
+    header = (
+        f"<b>🌍 Перевод ({arrow})</b>\n"
+        "<i>Текст распознан и отполирован. Нажмите «🌍 Перевести», чтобы получить перевод, "
+        "или «✏️ Исправить» — пришлите голосом/текстом исправленный вариант.</i>"
+    )
+    await _send_body_with_actions(
+        msg, context,
+        placeholder=placeholder,
+        header=header,
+        body=fmt.esc(polished),
+        reply_markup=kb.translate_actions_kb(
+            token, source_text=polished, translated_text="",
+        ),
+    )
+    for r in scheduled:
+        advance_part = (
+            f" (с уведомлением за {r.advance_minutes} мин)"
+            if r.advance_minutes > 0 else ""
+        )
+        await context.bot.send_message(
+            chat_id=msg.chat_id,
+            text=(
+                f"✅ Напоминание #{r.reminder_id} создано.\n"
+                f"⏰ <b>{fmt.fmt_fire_at(r.fire_at, cfg.tz)}</b>{advance_part}\n"
+                f"📝 {fmt.esc(r.text)}"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb.reminder_actions_kb(r.reminder_id),
+        )
 
 
 # ---- reminders scheduling ---------------------------------------------
