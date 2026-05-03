@@ -13,7 +13,7 @@ from formatter import (
 def _note(note_id: int = 1, **overrides) -> Note:
     summary = {
         "title": "Тест заметки",
-        "summary": ["пункт один", "пункт два"],
+        "details": "Развёрнутый пересказ заметки в один абзац: первый пункт и второй пункт.",
         "tasks": [{"what": "сделать отчёт", "who": "я", "when": "завтра"}],
         "open_questions": ["когда релиз?"],
         "tags": ["работа", "отчёт"],
@@ -38,15 +38,22 @@ def test_format_note_has_all_sections():
     out = format_note(_note())
     assert "Заметка #1" in out
     assert "Тест заметки" in out
-    assert "Главное" in out and "пункт один" in out
+    assert "Развёрнутый пересказ" in out
     assert "Задачи" in out and "сделать отчёт" in out and "👤 я" in out and "📅 завтра" in out
     assert "Открытые вопросы" in out and "когда релиз?" in out
     assert "#работа" in out and "#отчёт" in out
     assert "/get_1" in out
 
 
+def test_format_note_no_duplicated_summary_blocks():
+    """Главное / TL;DR убраны, чтобы не повторять details разными форматами."""
+    out = format_note(_note())
+    assert "Главное" not in out
+    assert "TL;DR" not in out
+
+
 def test_format_note_escapes_html():
-    n = _note(summary_overrides={"title": "<script>", "summary": ["<b>x</b>"], "tasks": [], "open_questions": [], "tags": []})
+    n = _note(summary_overrides={"title": "<script>", "details": "<b>x</b>", "tasks": [], "open_questions": [], "tags": []})
     out = format_note(n)
     assert "<script>" not in out
     assert "&lt;script&gt;" in out or "&lt;" in out
