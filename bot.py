@@ -221,6 +221,28 @@ def _xlate_cache_update(
     return entry
 
 
+# ---- Grok chat trigger ------------------------------------------------
+#
+# Активирует «грок-режим»: транскрипт обрабатывается как обычный вопрос ИИ
+# (без саммари / напоминаний / заметок / переводов). STT иногда искажает
+# имя — поддерживаем варианты «грок», «грог», «grok». Триггер должен быть
+# в самом начале (с возможной запятой/двоеточием/тире).
+_GROK_TRIGGER_RE = re.compile(
+    r"^\s*(?:гр[оаи]г+|gr[oa]g+|gr[oa]k+|гр[оаи]к+)\b[\s,:\-—–.!?]*",
+    re.IGNORECASE,
+)
+
+
+def _match_grok_trigger(text: str) -> str | None:
+    """Если text начинается с «Грок ...», вернёт остаток (сам вопрос).
+    Иначе None."""
+    m = _GROK_TRIGGER_RE.match(text or "")
+    if not m:
+        return None
+    rest = text[m.end():].strip()
+    return rest or None
+
+
 def _detect_target_lang(source_text: str) -> str:
     """Простое правило для RU↔EN: если в тексте есть кириллица — переводим на en,
     иначе на ru. Поддерживаем только две стороны."""
@@ -1136,6 +1158,19 @@ async def _process_summary(
     llm: GroqLLM = context.bot_data["llm"]
     msg = update.effective_message
 
+    # ---- Grok-чат. Если транскрипт начинается с «Грок ...» — это запрос ----
+    # к ИИ-ассистенту. Пропускаем структурирование/полировку/перевод/заметку,
+    # просто отвечаем на вопрос. Логи и БД не затрагиваются.
+    grok_question = _match_grok_trigger(transcript)
+    if grok_question is not None:
+        await _process_grok_chat(
+            update, context,
+            placeholder=placeholder,
+            question=grok_question,
+            source=source,
+        )
+        return
+
     try:
         summary: Summary = await llm.structure(
             transcript, now_context=now_context_block(cfg.tz)
@@ -1325,6 +1360,60 @@ async def _process_summary(
     logger.info(
         "polish response for user %d: source=%s, reminders=%d, saved_for_context=%s",
         user.id, source, len(scheduled), save_to_db,
+    )
+
+
+async def _process_grok_chat(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    placeholder,
+    question: str,
+    source: str,
+) -> None:
+    """Чат-режим: отвечаем на вопрос пользователя обычным AI-ответом.
+    Без сохранения в БД, без напоминаний, без саммари. Под ответом —
+    кнопка «📋 Скопировать» (CopyTextButton, single-tap, если умещается)."""
+    llm: GroqLLM = context.bot_data["llm"]
+    user = update.effective_user
+    msg = update.effective_message
+
+    if not question.strip():
+        await placeholder.edit_text(
+            "🤖 Грок слушает. Сформулируйте вопрос после слова «Грок ...» — "
+            "например, «Грок, что такое дискриминант».",
+            parse_mode=None,
+        )
+        return
+
+    try:
+        answer = await llm.chat(question)
+    except LLMError as e:
+        await placeholder.edit_text(
+            f"⚠️ Не смог сгенерировать ответ: {e}",
+            parse_mode=None,
+        )
+        return
+    except Exception as e:  # noqa: BLE001
+        logger.exception("grok chat failed")
+        await placeholder.edit_text(
+            f"⚠️ Ошибка ИИ-ответа ({type(e).__name__}).",
+            parse_mode=None,
+        )
+        return
+
+    # Кладём в xlate-кэш, чтобы под ответом работала и кнопка «🌍 Перевести».
+    token = _xlate_cache_put(context, user_id=user.id, source_text=answer)
+    await _send_body_with_actions(
+        msg, context,
+        placeholder=placeholder,
+        header="<b>🤖 Грок отвечает</b>",
+        body=fmt.esc(answer),
+        reply_markup=kb.polish_actions_kb(token, answer),
+    )
+    logger.info(
+        "grok chat for user %d: source=%s, q_len=%d, a_len=%d",
+        user.id, source, len(question), len(answer),
     )
 
 
