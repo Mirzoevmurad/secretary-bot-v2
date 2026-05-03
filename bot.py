@@ -894,18 +894,29 @@ async def _process_summary(
         )
         return
 
-    note_id = db.add_note(
-        user_id=user.id,
-        transcript=transcript,
-        summary=summary.model_dump(),
-        title=summary.title,
-        lang=lang,
-        duration_seconds=duration,
-        audio_path=audio_path_saved,
-        source=source,
+    # Решаем, сохранять ли заметку. По умолчанию — НЕТ. Сохраняем только если:
+    #   1) LLM решил, что это запись/структурный материал (should_save_note=true);
+    #   2) LLM пометил это как чистое напоминание (is_reminder_only=true) — заметку
+    #      сохраняем, но визуально не показываем (нужно для /list / поиска);
+    #   3) есть напоминание (нужно как контекст для напоминания).
+    save_note = bool(
+        summary.should_save_note or summary.is_reminder_only or summary.reminders
     )
-    note = db.get_note(note_id, user.id)
-    assert note is not None
+    note_id: int | None = None
+    note: Note | None = None
+    if save_note:
+        note_id = db.add_note(
+            user_id=user.id,
+            transcript=transcript,
+            summary=summary.model_dump(),
+            title=summary.title,
+            lang=lang,
+            duration_seconds=duration,
+            audio_path=audio_path_saved,
+            source=source,
+        )
+        note = db.get_note(note_id, user.id)
+        assert note is not None
 
     # materialize + schedule reminders
     scheduled = materialize_reminders(
@@ -946,46 +957,78 @@ async def _process_summary(
         )
         return
 
-    text = fmt.format_note(note, tz_name=cfg.tz, scheduled_reminders=scheduled)
+    # Ветка А — заметку сохраняем и показываем структурированный вид.
+    if save_note and note is not None:
+        text = fmt.format_note(note, tz_name=cfg.tz, scheduled_reminders=scheduled)
+        chunks = _split_for_telegram(text, limit=3900)
+        safe = not _has_unsafe_chunk(chunks, 3900)
+        note_kb = kb.note_actions_kb(note.note_id)
+        if safe:
+            await placeholder.edit_text(
+                chunks[0], parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                reply_markup=note_kb if len(chunks) == 1 else None,
+            )
+            for i, chunk in enumerate(chunks[1:], start=1):
+                kw = {"parse_mode": ParseMode.HTML, "disable_web_page_preview": True}
+                if i == len(chunks) - 1:
+                    kw["reply_markup"] = note_kb
+                await context.bot.send_message(chat_id=msg.chat_id, text=chunk, **kw)
+        else:
+            pieces = [text[i:i + 3900] for i in range(0, len(text), 3900)]
+            await placeholder.edit_text(
+                pieces[0], parse_mode=None, disable_web_page_preview=True,
+                reply_markup=note_kb if len(pieces) == 1 else None,
+            )
+            for i, piece in enumerate(pieces[1:], start=1):
+                kw = {"parse_mode": None, "disable_web_page_preview": True}
+                if i == len(pieces) - 1:
+                    kw["reply_markup"] = note_kb
+                await context.bot.send_message(chat_id=msg.chat_id, text=piece, **kw)
+        for r in scheduled:
+            await context.bot.send_message(
+                chat_id=msg.chat_id,
+                text=f"⏰ Напоминание #{r.reminder_id}: {fmt.esc(r.text)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb.reminder_actions_kb(r.reminder_id),
+            )
+        logger.info(
+            "note #%d for user %d: source=%s, reminders=%d",
+            note_id, user.id, source, len(scheduled),
+        )
+        return
+
+    # Ветка Б — заметку НЕ сохраняем. Возвращаем отполированный текст реплики.
+    try:
+        polished = await llm.polish(transcript)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("polish fallback to raw: %s", e)
+        polished = transcript
+    body = fmt.esc(polished)
+    text = f"<b>📝 Полированный текст</b>\n\n{body}"
     chunks = _split_for_telegram(text, limit=3900)
     safe = not _has_unsafe_chunk(chunks, 3900)
-    note_kb = kb.note_actions_kb(note.note_id)
     if safe:
-        # placeholder редактируем без клавиатуры (кнопки вешаем на последнее сообщение,
-        # чтобы было одно «активное» меню под полным текстом).
         await placeholder.edit_text(
             chunks[0], parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-            reply_markup=note_kb if len(chunks) == 1 else None,
         )
-        for i, chunk in enumerate(chunks[1:], start=1):
-            kw = {"parse_mode": ParseMode.HTML, "disable_web_page_preview": True}
-            if i == len(chunks) - 1:
-                kw["reply_markup"] = note_kb
-            await context.bot.send_message(chat_id=msg.chat_id, text=chunk, **kw)
+        for chunk in chunks[1:]:
+            await context.bot.send_message(
+                chat_id=msg.chat_id, text=chunk,
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            )
     else:
         pieces = [text[i:i + 3900] for i in range(0, len(text), 3900)]
         await placeholder.edit_text(
             pieces[0], parse_mode=None, disable_web_page_preview=True,
-            reply_markup=note_kb if len(pieces) == 1 else None,
         )
-        for i, piece in enumerate(pieces[1:], start=1):
-            kw = {"parse_mode": None, "disable_web_page_preview": True}
-            if i == len(pieces) - 1:
-                kw["reply_markup"] = note_kb
-            await context.bot.send_message(chat_id=msg.chat_id, text=piece, **kw)
-
-    # Отдельные сообщения с кнопками для каждого созданного напоминания —
-    # чтобы их можно было сразу перенести/отменить, не открывая /reminders.
-    for r in scheduled:
-        await context.bot.send_message(
-            chat_id=msg.chat_id,
-            text=f"⏰ Напоминание #{r.reminder_id}: {fmt.esc(r.text)}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb.reminder_actions_kb(r.reminder_id),
-        )
+        for piece in pieces[1:]:
+            await context.bot.send_message(
+                chat_id=msg.chat_id, text=piece,
+                parse_mode=None, disable_web_page_preview=True,
+            )
     logger.info(
-        "note #%d for user %d: source=%s, reminders=%d",
-        note_id, user.id, source, len(scheduled),
+        "polish-only response for user %d: source=%s, reminders=%d",
+        user.id, source, len(scheduled),
     )
 
 
