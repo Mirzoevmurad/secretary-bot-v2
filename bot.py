@@ -688,9 +688,12 @@ async def _apply_pending_edit(
                 "Текст не найден (возможно, бот был перезапущен). Пришлите запрос на перевод заново."
             )
             return
-        # Обновляем исходник, переводим и показываем перевод.
+        # Обновляем исходник + ОБЯЗАТЕЛЬНО сбрасываем старый перевод (передаём
+        # пустую строку, а не None — иначе _xlate_cache_update сохранит старый
+        # перевод, и при ошибке llm.translate() он будет показан как актуальный
+        # для уже изменённого исходника).
         target = _detect_target_lang(new_value)
-        _xlate_cache_update(context, token, src=new_value, translated=None)
+        _xlate_cache_update(context, token, src=new_value, translated="")
         llm: GroqLLM = context.bot_data["llm"]
         try:
             translated = await llm.translate(new_value, target)
