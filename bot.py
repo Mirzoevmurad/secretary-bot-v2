@@ -1048,8 +1048,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         current_src = (entry.get("src") or "").strip() or None
         current_block = ""
         if current_src:
+            # Telegram-лимит на сообщение — 4096 символов. Полированный текст
+            # (особенно Грок-ответ) может быть длиннее. Усечём блок «Сейчас:»
+            # до 2000 символов, чтобы prompt всегда влезал; сама правка идёт
+            # ответом пользователя — полная версия в edit-pipeline сохранится.
+            display_src = current_src
+            if len(display_src) > 2000:
+                display_src = display_src[:2000] + "…"
             current_block = (
-                f"\n\n<b>Сейчас:</b>\n<code>{fmt.esc(current_src)}</code>"
+                f"\n\n<b>Сейчас:</b>\n<code>{fmt.esc(display_src)}</code>"
             )
         prompt = await context.bot.send_message(
             chat_id=q.message.chat_id,
