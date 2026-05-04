@@ -64,12 +64,14 @@ def test_polish_actions_kb_short_text_has_copy_button():
     # должна быть кнопка с copy_text (CopyTextButton) и кнопка callback_data
     has_copy = any(getattr(b, "copy_text", None) is not None for b in buttons)
     has_translate_cb = any(b.callback_data == "x:tr:abcd1234" for b in buttons)
+    has_save_cb = any(b.callback_data == "x:save:abcd1234" for b in buttons)
     assert has_copy
     assert has_translate_cb
+    assert has_save_cb
 
 
 def test_polish_actions_kb_long_text_skips_copy_button():
-    """При длинном тексте (>256 символов) CopyTextButton не строится — только перевод."""
+    """При длинном тексте (>256 символов) CopyTextButton не строится — но Перевести и В заметки остаются."""
     long_text = "x" * 300
     kb_obj = polish_actions_kb("tok", long_text)
     buttons = _all_buttons(kb_obj)
@@ -77,6 +79,15 @@ def test_polish_actions_kb_long_text_skips_copy_button():
     assert not has_copy
     cb = {b.callback_data for b in buttons if b.callback_data}
     assert "x:tr:tok" in cb
+    assert "x:save:tok" in cb
+
+
+def test_polish_actions_kb_show_save_false_hides_save_button():
+    """show_save=False (Грок-режим) — кнопки «В заметки» нет."""
+    kb_obj = polish_actions_kb("tok", "короткий ответ", show_save=False)
+    cb = {b.callback_data for b in _all_buttons(kb_obj) if b.callback_data}
+    assert "x:tr:tok" in cb
+    assert "x:save:tok" not in cb
 
 
 def test_translate_actions_kb_callbacks():
