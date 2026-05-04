@@ -10,7 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from telegram import BotCommand, ForceReply, Update
+from telegram import BotCommand, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
@@ -641,14 +641,19 @@ async def _ask_for_edit(
     field: str,
 ) -> None:
     prompt_text = _FIELD_PROMPTS.get(field, "Пришлите новое значение")
+    # Не используем ForceReply — Telegram-клиент сохраняет его «реплай-окно»
+    # между сессиями и при возврате в чат показывает его снова, даже если
+    # пользователь хочет просто открыть бота. Вместо этого — обычный prompt
+    # + inline-кнопка отмены. Внутри pending_edit состояние всё равно живёт.
     prompt = await context.bot.send_message(
         chat_id=chat_id,
         text=(
             f"✏️ {prompt_text}\n\n"
-            "<i>Можно ответить текстом или голосовым 🎤 — следующее сообщение применится.</i>"
+            "<i>Ответьте текстом или голосовым 🎤 — следующее сообщение применится. "
+            "Чтобы отменить — нажмите кнопку или пришлите любую /команду.</i>"
         ),
         parse_mode=ParseMode.HTML,
-        reply_markup=ForceReply(selective=True, input_field_placeholder="новое значение…"),
+        reply_markup=kb.cancel_edit_kb(),
     )
     if context.user_data is None:
         return
@@ -825,6 +830,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             pass
         return
 
+    # Сброс активного pending_edit. Используется кнопкой «❌ Отмена» под
+    # промптом edit/перевода (взамен ForceReply).
+    if data == "x:cancel_edit":
+        if context.user_data is not None:
+            context.user_data.pop("pending_edit", None)
+        await q.answer("Отменено.")
+        try:
+            await q.edit_message_text("✖️ Редактирование отменено.")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
     parts = data.split(":")
     if len(parts) < 2:
         await q.answer("Неизвестное действие.")
@@ -983,12 +1000,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             chat_id=q.message.chat_id,
             text=(
                 "✏️ Пришлите исправленный текст (голосом 🎤 или текстом). "
-                "Применю и сразу переведу."
+                "Применю и сразу переведу.\n"
+                "<i>Чтобы отменить — кнопка ниже или любая /команда.</i>"
             ),
             parse_mode=ParseMode.HTML,
-            reply_markup=ForceReply(
-                selective=True, input_field_placeholder="исправленный текст…",
-            ),
+            reply_markup=kb.cancel_edit_kb(),
         )
         if context.user_data is not None:
             context.user_data["pending_edit"] = {
@@ -1022,6 +1038,94 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             reply_markup=kb.translate_actions_kb(
                 token, source_text=src, translated_text=translated,
             ),
+        )
+        return
+    # x:save:<token> — сохранить полированный текст как заметку
+    # (с структурированием: тэги, категория, задачи, саммари).
+    if parts[0] == "x" and parts[1] == "save" and len(parts) == 3:
+        token = parts[2]
+        entry = _xlate_cache_get(context).get(token)
+        if entry is None or entry.get("user_id") != user_id:
+            await q.answer("Текст не найден (бот мог быть перезапущен).", show_alert=True)
+            return
+        src = (entry.get("src") or "").strip()
+        if not src:
+            await q.answer("Пустой текст.", show_alert=True)
+            return
+        await q.answer("Сохраняю в заметки…")
+        # Убираем кнопку «📝 В заметки» с исходного сообщения сразу — чтобы
+        # повторные клики (например пока идёт LLM) не создали дубль.
+        # Оставляем «📋 Скопировать» и «🌍 Перевести» (show_save=False).
+        try:
+            await q.edit_message_reply_markup(
+                reply_markup=kb.polish_actions_kb(token, src, show_save=False),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        llm: GroqLLM = context.bot_data["llm"]
+        try:
+            summary: Summary = await llm.structure(
+                src, now_context=now_context_block(cfg.tz),
+            )
+        except LLMError as e:
+            await q.message.reply_text(f"⚠️ Не смог структурировать: {e}")
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.exception("save-as-note structure failed")
+            await q.message.reply_text(
+                f"⚠️ Ошибка структурирования ({type(e).__name__})."
+            )
+            return
+        note_id = db.add_note(
+            user_id=user_id,
+            transcript=src,
+            summary=summary.model_dump(),
+            title=summary.title,
+            lang=None,
+            duration_seconds=None,
+            audio_path=None,
+            source="manual_save",
+        )
+        note = db.get_note(note_id, user_id)
+        # Планируем напоминания, если LLM их выделил.
+        scheduled = materialize_reminders(
+            db, user_id, summary.reminders, cfg.tz,
+            cfg.default_advance_minutes, source_note_id=note_id,
+        )
+        for r in scheduled:
+            _schedule_reminder(context.application, r)
+        # Защита: get_note возвращает Optional. add_note только что вернул id,
+        # так что здесь None — крайне маловероятный кейс (рейс/удаление между
+        # двумя запросами). Защищаемся, чтобы не упасть с AttributeError.
+        if note is None:
+            await q.message.reply_text(
+                f"✅ Заметка #{note_id} сохранена. /get_{note_id} — посмотреть."
+            )
+            return
+        # Показываем полный конспект.
+        await _reply_long_html(
+            q.message,
+            fmt.format_note(note, tz_name=cfg.tz),
+            reply_markup=kb.note_actions_kb(note.note_id),
+        )
+        for r in scheduled:
+            advance_part = (
+                f" (с уведомлением за {r.advance_minutes} мин)"
+                if r.advance_minutes > 0 else ""
+            )
+            await context.bot.send_message(
+                chat_id=q.message.chat_id,
+                text=(
+                    f"✅ Напоминание #{r.reminder_id} создано.\n"
+                    f"⏰ <b>{fmt.fmt_fire_at(r.fire_at, cfg.tz)}</b>{advance_part}\n"
+                    f"📝 {fmt.esc(r.text)}"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb.reminder_actions_kb(r.reminder_id),
+            )
+        logger.info(
+            "manual save-as-note for user %d: note_id=%d, reminders=%d",
+            user_id, note_id, len(scheduled),
         )
         return
     # r:cancel_yes:5
@@ -1335,12 +1439,17 @@ async def _process_summary(
         logger.warning("polish fallback to raw: %s", e)
         polished = transcript
     token = _xlate_cache_put(context, user_id=user.id, source_text=polished)
+    # Если заметка уже сохранена в БД (для контекста, потому что есть напоминание
+    # без явного «запиши»), кнопку «📝 В заметки» прятать — повторный клик
+    # создал бы дубль. Иначе показываем — даём пользователю явный путь сохранить.
     await _send_body_with_actions(
         msg, context,
         placeholder=placeholder,
         header="<b>📝 Полированный текст</b>",
         body=fmt.esc(polished),
-        reply_markup=kb.polish_actions_kb(token, polished),
+        reply_markup=kb.polish_actions_kb(
+            token, polished, show_save=not save_to_db,
+        ),
     )
     for r in scheduled:
         advance_part = (
@@ -1409,7 +1518,7 @@ async def _process_grok_chat(
         placeholder=placeholder,
         header="<b>🤖 Грок отвечает</b>",
         body=fmt.esc(answer),
-        reply_markup=kb.polish_actions_kb(token, answer),
+        reply_markup=kb.polish_actions_kb(token, answer, show_save=False),
     )
     logger.info(
         "grok chat for user %d: source=%s, q_len=%d, a_len=%d",

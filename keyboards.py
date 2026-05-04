@@ -15,6 +15,8 @@ Callback-data формат: короткие префиксы (Telegram limit = 
 - x:tr:<token>       — translate cached polished text
 - x:edit:<token>     — edit cached polished text and translate
 - x:back:<token>     — restore original (после перевода)
+- x:save:<token>     — сохранить полированный текст как заметку (структура+теги)
+- x:cancel_edit      — отменить активный pending_edit (без ForceReply)
 - nop                — кнопка-разделитель / отмена пришедшего prompt
 """
 from __future__ import annotations
@@ -110,25 +112,45 @@ def confirm_cancel_reminder_kb(reminder_id: int) -> InlineKeyboardMarkup:
 COPY_BUTTON_LIMIT = 256
 
 
+def cancel_edit_kb() -> InlineKeyboardMarkup:
+    """Под промптом «Пришлите новое значение» — кнопка отмены edit-режима."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Отмена", callback_data="x:cancel_edit")]]
+    )
+
+
 def _copy_button(text: str, label: str) -> InlineKeyboardButton | None:
     if not text or len(text) > COPY_BUTTON_LIMIT:
         return None
     return InlineKeyboardButton(label, copy_text=CopyTextButton(text=text))
 
 
-def polish_actions_kb(token: str, polished_text: str) -> InlineKeyboardMarkup:
-    """Кнопки под полированным ответом (без сохранения как заметки).
+def polish_actions_kb(
+    token: str,
+    polished_text: str,
+    *,
+    show_save: bool = True,
+) -> InlineKeyboardMarkup:
+    """Кнопки под полированным ответом.
     Содержит:
       - 📋 Скопировать (CopyTextButton с самим текстом, по тапу — clipboard);
-      - 🌍 Перевести (RU↔EN, направление автоматическое).
+      - 🌍 Перевести (RU↔EN, направление автоматическое);
+      - 📝 В заметки (по запросу): запускает структурирование (тэги/категория/
+        задачи/саммари) и сохраняет в БД. show_save=False — для контекстов,
+        где сохранение неуместно (Грок-чат).
     """
     rows: list[list[InlineKeyboardButton]] = []
     copy_btn = _copy_button(polished_text, "📋 Скопировать")
     if copy_btn is not None:
         rows.append([copy_btn])
-    rows.append([
+    action_row = [
         InlineKeyboardButton("🌍 Перевести", callback_data=f"x:tr:{token}"),
-    ])
+    ]
+    if show_save:
+        action_row.append(
+            InlineKeyboardButton("📝 В заметки", callback_data=f"x:save:{token}")
+        )
+    rows.append(action_row)
     return InlineKeyboardMarkup(rows)
 
 
