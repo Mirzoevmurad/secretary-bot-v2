@@ -1422,12 +1422,17 @@ async def _process_summary(
         logger.warning("polish fallback to raw: %s", e)
         polished = transcript
     token = _xlate_cache_put(context, user_id=user.id, source_text=polished)
+    # Если заметка уже сохранена в БД (для контекста, потому что есть напоминание
+    # без явного «запиши»), кнопку «📝 В заметки» прятать — повторный клик
+    # создал бы дубль. Иначе показываем — даём пользователю явный путь сохранить.
     await _send_body_with_actions(
         msg, context,
         placeholder=placeholder,
         header="<b>📝 Полированный текст</b>",
         body=fmt.esc(polished),
-        reply_markup=kb.polish_actions_kb(token, polished),
+        reply_markup=kb.polish_actions_kb(
+            token, polished, show_save=not save_to_db,
+        ),
     )
     for r in scheduled:
         advance_part = (
