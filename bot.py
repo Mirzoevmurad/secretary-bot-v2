@@ -1085,6 +1085,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         for r in scheduled:
             _schedule_reminder(context.application, r)
+        # Защита: get_note возвращает Optional. add_note только что вернул id,
+        # так что здесь None — крайне маловероятный кейс (рейс/удаление между
+        # двумя запросами). Защищаемся, чтобы не упасть с AttributeError.
+        if note is None:
+            await q.message.reply_text(
+                f"✅ Заметка #{note_id} сохранена. /get_{note_id} — посмотреть."
+            )
+            return
         # Показываем полный конспект.
         await _reply_long_html(
             q.message,
