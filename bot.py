@@ -633,14 +633,63 @@ _FIELD_PROMPTS = {
 }
 
 
+def _current_value_for_edit(
+    db: Database, cfg: Config, kind: str, item_id: int, field: str, user_id: int,
+) -> str | None:
+    """Возвращает текущее значение редактируемого поля, чтобы показать его
+    в prompt'е (и кнопке «📋 Скопировать текущее»). None — если получить не
+    получилось (объект не найден или поле пустое)."""
+    if kind == "note":
+        note = db.get_note(item_id, user_id)
+        if note is None:
+            return None
+        if field == "title":
+            return note.title or None
+        if field == "cat":
+            return (note.summary.get("category") or "").strip() or None
+        if field == "tags":
+            tags = note.summary.get("tags") or []
+            if isinstance(tags, list):
+                return ", ".join(str(t) for t in tags) or None
+            return str(tags) or None
+    elif kind == "rem":
+        rem = db.get_reminder(item_id, user_id)
+        if rem is None:
+            return None
+        if field == "rtext":
+            return rem.text or None
+        if field == "rtime":
+            return fmt.fmt_fire_at(rem.fire_at, cfg.tz)
+    return None
+
+
 async def _ask_for_edit(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     kind: str,
     item_id: int,
     field: str,
+    *,
+    user_id: int | None = None,
 ) -> None:
     prompt_text = _FIELD_PROMPTS.get(field, "Пришлите новое значение")
+    # Достаём текущее значение из БД — показываем в prompt'е и (если умещается)
+    # отдельной кнопкой «📋 Скопировать текущее», чтобы не набирать всё с нуля.
+    current_value: str | None = None
+    if user_id is not None:
+        try:
+            db: Database = context.bot_data["db"]
+            cfg: Config = context.bot_data["cfg"]
+            current_value = _current_value_for_edit(db, cfg, kind, item_id, field, user_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("could not fetch current value for edit prompt")
+    current_block = ""
+    if current_value:
+        # Показываем в <code>…</code> — long-press на телефоне даёт «Copy».
+        # Кнопка ниже даёт single-tap copy (если текст ≤256 символов).
+        current_block = (
+            f"\n\n<b>Сейчас:</b>\n<code>{fmt.esc(current_value)}</code>"
+        )
     # Не используем ForceReply — Telegram-клиент сохраняет его «реплай-окно»
     # между сессиями и при возврате в чат показывает его снова, даже если
     # пользователь хочет просто открыть бота. Вместо этого — обычный prompt
@@ -648,12 +697,12 @@ async def _ask_for_edit(
     prompt = await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            f"✏️ {prompt_text}\n\n"
+            f"✏️ {prompt_text}{current_block}\n\n"
             "<i>Ответьте текстом или голосовым 🎤 — следующее сообщение применится. "
             "Чтобы отменить — нажмите кнопку или пришлите любую /команду.</i>"
         ),
         parse_mode=ParseMode.HTML,
-        reply_markup=kb.cancel_edit_kb(),
+        reply_markup=kb.cancel_edit_kb(current_value),
     )
     if context.user_data is None:
         return
@@ -849,7 +898,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # n:e:title:42 / n:e:cat:42 / n:e:tags:42
     if parts[0] == "n" and parts[1] == "e" and len(parts) == 4:
         await q.answer()
-        await _ask_for_edit(context, q.message.chat_id, "note", int(parts[3]), parts[2])
+        await _ask_for_edit(context, q.message.chat_id, "note", int(parts[3]), parts[2], user_id=user_id)
         return
     # n:open:42
     if parts[0] == "n" and parts[1] == "open" and len(parts) == 3:
@@ -944,7 +993,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await q.answer()
         field_map = {"time": "rtime", "text": "rtext"}
         field = field_map.get(parts[2], parts[2])
-        await _ask_for_edit(context, q.message.chat_id, "rem", int(parts[3]), field)
+        await _ask_for_edit(context, q.message.chat_id, "rem", int(parts[3]), field, user_id=user_id)
         return
     # r:cancel:5 → подтверждение
     if parts[0] == "r" and parts[1] == "cancel" and len(parts) == 3:
@@ -996,15 +1045,29 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await q.answer("Текст не найден (бот мог быть перезапущен).", show_alert=True)
             return
         await q.answer()
+        current_src = (entry.get("src") or "").strip() or None
+        current_block = ""
+        if current_src:
+            # Telegram-лимит на сообщение — 4096 символов. Полированный текст
+            # (особенно Грок-ответ) может быть длиннее. Усечём блок «Сейчас:»
+            # до 2000 символов, чтобы prompt всегда влезал; сама правка идёт
+            # ответом пользователя — полная версия в edit-pipeline сохранится.
+            display_src = current_src
+            if len(display_src) > 2000:
+                display_src = display_src[:2000] + "…"
+            current_block = (
+                f"\n\n<b>Сейчас:</b>\n<code>{fmt.esc(display_src)}</code>"
+            )
         prompt = await context.bot.send_message(
             chat_id=q.message.chat_id,
             text=(
                 "✏️ Пришлите исправленный текст (голосом 🎤 или текстом). "
-                "Применю и сразу переведу.\n"
+                "Применю и сразу переведу."
+                f"{current_block}\n\n"
                 "<i>Чтобы отменить — кнопка ниже или любая /команда.</i>"
             ),
             parse_mode=ParseMode.HTML,
-            reply_markup=kb.cancel_edit_kb(),
+            reply_markup=kb.cancel_edit_kb(current_src),
         )
         if context.user_data is not None:
             context.user_data["pending_edit"] = {

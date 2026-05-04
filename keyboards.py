@@ -112,11 +112,20 @@ def confirm_cancel_reminder_kb(reminder_id: int) -> InlineKeyboardMarkup:
 COPY_BUTTON_LIMIT = 256
 
 
-def cancel_edit_kb() -> InlineKeyboardMarkup:
-    """Под промптом «Пришлите новое значение» — кнопка отмены edit-режима."""
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("❌ Отмена", callback_data="x:cancel_edit")]]
-    )
+def cancel_edit_kb(current_value: str | None = None) -> InlineKeyboardMarkup:
+    """Под промптом «Пришлите новое значение».
+    Если передан current_value и он умещается в CopyTextButton (≤256 символов
+    и непустой) — добавляем кнопку «📋 Скопировать текущее» отдельной строкой,
+    чтобы пользователь по тапу скопировал текущее значение, вставил в поле
+    ввода и поправил, не набирая всё с нуля.
+    Внизу — кнопка «❌ Отмена» (callback x:cancel_edit).
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    copy_btn = _copy_button(current_value or "", "📋 Скопировать текущее")
+    if copy_btn is not None:
+        rows.append([copy_btn])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="x:cancel_edit")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _copy_button(text: str, label: str) -> InlineKeyboardButton | None:
