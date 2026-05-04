@@ -1053,6 +1053,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await q.answer("Пустой текст.", show_alert=True)
             return
         await q.answer("Сохраняю в заметки…")
+        # Убираем кнопку «📝 В заметки» с исходного сообщения сразу — чтобы
+        # повторные клики (например пока идёт LLM) не создали дубль.
+        # Оставляем «📋 Скопировать» и «🌍 Перевести» (show_save=False).
+        try:
+            await q.edit_message_reply_markup(
+                reply_markup=kb.polish_actions_kb(token, src, show_save=False),
+            )
+        except Exception:  # noqa: BLE001
+            pass
         llm: GroqLLM = context.bot_data["llm"]
         try:
             summary: Summary = await llm.structure(
