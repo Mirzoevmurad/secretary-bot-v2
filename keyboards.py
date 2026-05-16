@@ -1,13 +1,6 @@
-"""InlineKeyboardMarkup builders для заметок и напоминаний.
+"""InlineKeyboardMarkup builders для напоминаний и полировки/перевода.
 
 Callback-data формат: короткие префиксы (Telegram limit = 64 байта).
-- n:e:title:42       — edit note title
-- n:e:cat:42         — edit note category
-- n:e:tags:42        — edit note tags
-- n:del:42           — ask to delete note (показать confirm)
-- n:open:42          — open note detail (из списка)
-- n:del_yes:42       — confirm delete
-- n:polish:42        — полировать транскрипт LLM
 - r:e:time:5         — edit reminder fire_at
 - r:e:text:5         — edit reminder text
 - r:cancel:5         — ask to cancel reminder (confirm)
@@ -15,52 +8,12 @@ Callback-data формат: короткие префиксы (Telegram limit = 
 - x:tr:<token>       — translate cached polished text
 - x:edit:<token>     — edit cached polished text and translate
 - x:back:<token>     — restore original (после перевода)
-- x:save:<token>     — сохранить полированный текст как заметку (структура+теги)
 - x:cancel_edit      — отменить активный pending_edit (без ForceReply)
 - nop                — кнопка-разделитель / отмена пришедшего prompt
 """
 from __future__ import annotations
 
 from telegram import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
-
-
-def note_actions_kb(note_id: int) -> InlineKeyboardMarkup:
-    """Кнопки под одиночной заметкой."""
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✏️ Заголовок", callback_data=f"n:e:title:{note_id}"),
-                InlineKeyboardButton("🏷 Категория", callback_data=f"n:e:cat:{note_id}"),
-            ],
-            [
-                InlineKeyboardButton("# Теги", callback_data=f"n:e:tags:{note_id}"),
-                InlineKeyboardButton("📝 Полировать", callback_data=f"n:polish:{note_id}"),
-            ],
-            [
-                InlineKeyboardButton("🗑 Удалить", callback_data=f"n:del:{note_id}"),
-            ],
-        ]
-    )
-
-
-def note_list_kb(note_ids: list[int]) -> InlineKeyboardMarkup:
-    """Кнопка «Открыть #N» для каждой заметки в /list. Не более 25 заметок (TG лимит ~100 кнопок)."""
-    rows = [
-        [InlineKeyboardButton(f"📄 Открыть #{nid}", callback_data=f"n:open:{nid}")]
-        for nid in note_ids[:25]
-    ]
-    return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
-
-
-def confirm_delete_note_kb(note_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Да, удалить", callback_data=f"n:del_yes:{note_id}"),
-                InlineKeyboardButton("❌ Отмена", callback_data="nop"),
-            ]
-        ]
-    )
 
 
 def reminder_actions_kb(reminder_id: int) -> InlineKeyboardMarkup:
@@ -137,16 +90,11 @@ def _copy_button(text: str, label: str) -> InlineKeyboardButton | None:
 def polish_actions_kb(
     token: str,
     polished_text: str,
-    *,
-    show_save: bool = True,
 ) -> InlineKeyboardMarkup:
     """Кнопки под полированным ответом.
     Содержит:
       - 📋 Скопировать (CopyTextButton с самим текстом, по тапу — clipboard);
-      - 🌍 Перевести (RU↔EN, направление автоматическое);
-      - 📝 В заметки (по запросу): запускает структурирование (тэги/категория/
-        задачи/саммари) и сохраняет в БД. show_save=False — для контекстов,
-        где сохранение неуместно (Грок-чат).
+      - 🌍 Перевести (RU↔EN, направление автоматическое).
     """
     rows: list[list[InlineKeyboardButton]] = []
     copy_btn = _copy_button(polished_text, "📋 Скопировать")
@@ -155,10 +103,6 @@ def polish_actions_kb(
     action_row = [
         InlineKeyboardButton("🌍 Перевести", callback_data=f"x:tr:{token}"),
     ]
-    if show_save:
-        action_row.append(
-            InlineKeyboardButton("📝 В заметки", callback_data=f"x:save:{token}")
-        )
     rows.append(action_row)
     return InlineKeyboardMarkup(rows)
 

@@ -1,7 +1,6 @@
-"""SQLite-хранилище: заметки + FTS-поиск."""
+"""SQLite-хранилище: напоминания."""
 from __future__ import annotations
 
-import json
 import sqlite3
 import time
 import threading
@@ -22,42 +21,6 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS notes (
-    note_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    duration_seconds REAL,
-    lang TEXT,
-    title TEXT,
-    transcript TEXT NOT NULL,
-    summary_json TEXT NOT NULL,       -- {summary: [...], tasks: [...], tags: [...], open_questions: [...]}
-    audio_path TEXT,                  -- NULL если аудио удалено после обработки
-    source TEXT DEFAULT 'voice',      -- 'voice' | 'audio' (форвард)
-    FOREIGN KEY (user_id) REFERENCES users(user_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_notes_user_created ON notes(user_id, created_at DESC);
-
--- FTS5 для поиска по транскрипту + заголовку
-CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-    title,
-    transcript,
-    content='notes',
-    content_rowid='note_id',
-    tokenize='unicode61 remove_diacritics 2'
-);
-
-CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
-    INSERT INTO notes_fts(rowid, title, transcript) VALUES (new.note_id, new.title, new.transcript);
-END;
-CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
-    INSERT INTO notes_fts(notes_fts, rowid, title, transcript) VALUES('delete', old.note_id, old.title, old.transcript);
-END;
-CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
-    INSERT INTO notes_fts(notes_fts, rowid, title, transcript) VALUES('delete', old.note_id, old.title, old.transcript);
-    INSERT INTO notes_fts(rowid, title, transcript) VALUES (new.note_id, new.title, new.transcript);
-END;
-
 CREATE TABLE IF NOT EXISTS reminders (
     reminder_id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -65,7 +28,7 @@ CREATE TABLE IF NOT EXISTS reminders (
     fire_at INTEGER NOT NULL,                 -- epoch UTC секунд
     advance_minutes INTEGER NOT NULL DEFAULT 0,
     text TEXT NOT NULL,
-    source_note_id INTEGER,                   -- если напоминание создано из заметки
+    source_note_id INTEGER,                   -- legacy, always NULL now
     status TEXT NOT NULL DEFAULT 'pending',   -- pending | fired | cancelled
     fired_at INTEGER,
     FOREIGN KEY (user_id) REFERENCES users(user_id)
@@ -74,20 +37,6 @@ CREATE TABLE IF NOT EXISTS reminders (
 CREATE INDEX IF NOT EXISTS idx_reminders_user_status ON reminders(user_id, status, fire_at);
 CREATE INDEX IF NOT EXISTS idx_reminders_fire_at ON reminders(fire_at);
 """
-
-
-@dataclass(slots=True)
-class Note:
-    note_id: int
-    user_id: int
-    created_at: int
-    duration_seconds: float | None
-    lang: str | None
-    title: str
-    transcript: str
-    summary: dict
-    audio_path: str | None
-    source: str
 
 
 @dataclass(slots=True)
@@ -158,118 +107,7 @@ class Database:
             row = self._conn.execute("SELECT lang FROM users WHERE user_id=?", (user_id,)).fetchone()
             return row["lang"] if row else None
 
-        # ---- notes ---------------------------------------------------------
-
-    def add_note(
-        self,
-        *,
-        user_id: int,
-        transcript: str,
-        summary: dict,
-        title: str,
-        lang: str | None,
-        duration_seconds: float | None,
-        audio_path: str | None,
-        source: str,
-    ) -> int:
-        now = int(time.time())
-        with self._tx() as c:
-            cur = c.execute(
-                """INSERT INTO notes (user_id, created_at, duration_seconds, lang, title, transcript, summary_json, audio_path, source)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                (
-                    user_id,
-                    now,
-                    duration_seconds,
-                    lang,
-                    title,
-                    transcript,
-                    json.dumps(summary, ensure_ascii=False),
-                    audio_path,
-                    source,
-                ),
-            )
-            return int(cur.lastrowid)
-
-    def get_note(self, note_id: int, user_id: int) -> Note | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM notes WHERE note_id=? AND user_id=?",
-                (note_id, user_id),
-            ).fetchone()
-            return _to_note(row) if row else None
-
-    def last_note(self, user_id: int) -> Note | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM notes WHERE user_id=? ORDER BY created_at DESC, note_id DESC LIMIT 1",
-                (user_id,),
-            ).fetchone()
-            return _to_note(row) if row else None
-
-    def list_notes(self, user_id: int, limit: int = 10) -> list[Note]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM notes WHERE user_id=? ORDER BY created_at DESC, note_id DESC LIMIT ?",
-                (user_id, limit),
-            ).fetchall()
-            return [_to_note(r) for r in rows]
-
-    def delete_note(self, note_id: int, user_id: int) -> bool:
-        with self._tx() as c:
-            cur = c.execute("DELETE FROM notes WHERE note_id=? AND user_id=?", (note_id, user_id))
-            return cur.rowcount > 0
-
-    def update_note_title(self, note_id: int, user_id: int, new_title: str) -> bool:
-        """Меняет title заметки и одновременно поле title в summary_json."""
-        note = self.get_note(note_id, user_id)
-        if note is None:
-            return False
-        new_summary = dict(note.summary)
-        new_summary["title"] = new_title
-        with self._tx() as c:
-            cur = c.execute(
-                "UPDATE notes SET title=?, summary_json=? WHERE note_id=? AND user_id=?",
-                (new_title, json.dumps(new_summary, ensure_ascii=False), note_id, user_id),
-            )
-            return cur.rowcount > 0
-
-    def update_note_summary_field(
-        self, note_id: int, user_id: int, field: str, value
-    ) -> bool:
-        """Обновляет произвольное поле в summary_json (category/tags/...)."""
-        note = self.get_note(note_id, user_id)
-        if note is None:
-            return False
-        new_summary = dict(note.summary)
-        new_summary[field] = value
-        with self._tx() as c:
-            cur = c.execute(
-                "UPDATE notes SET summary_json=? WHERE note_id=? AND user_id=?",
-                (json.dumps(new_summary, ensure_ascii=False), note_id, user_id),
-            )
-            return cur.rowcount > 0
-
-    def delete_all(self, user_id: int) -> int:
-        with self._tx() as c:
-            cur = c.execute("DELETE FROM notes WHERE user_id=?", (user_id,))
-            return cur.rowcount
-
-    def search(self, user_id: int, query: str, limit: int = 10) -> list[Note]:
-        with self._lock:
-            q = _sanitize_fts(query)
-            if not q:
-                return []
-            rows = self._conn.execute(
-                """SELECT n.* FROM notes n
-                   JOIN notes_fts f ON f.rowid = n.note_id
-                   WHERE n.user_id = ? AND notes_fts MATCH ?
-                   ORDER BY n.created_at DESC LIMIT ?""",
-                (user_id, q, limit),
-            ).fetchall()
-            return [_to_note(r) for r in rows]
-
-        # ---- reminders -----------------------------------------------------
+    # ---- reminders -----------------------------------------------------
 
     def add_reminder(
         self,
@@ -298,8 +136,8 @@ class Database:
             return _to_reminder(row) if row else None
 
     def get_reminder_any(self, reminder_id: int) -> Reminder | None:
+        """Без проверки user_id — для job-callback'ов, где user_id известен из самого reminder."""
         with self._lock:
-            """Без проверки user_id — для job-callback'ов, где user_id известен из самого reminder."""
             row = self._conn.execute(
                 "SELECT * FROM reminders WHERE reminder_id=?",
                 (reminder_id,),
@@ -315,8 +153,8 @@ class Database:
             return [_to_reminder(r) for r in rows]
 
     def all_pending_reminders(self) -> list[Reminder]:
+        """Используется при старте бота, чтобы перепланировать все висящие задачи."""
         with self._lock:
-            """Используется при старте бота, чтобы перепланировать все висящие задачи."""
             rows = self._conn.execute(
                 "SELECT * FROM reminders WHERE status='pending' ORDER BY fire_at ASC",
             ).fetchall()
@@ -364,60 +202,16 @@ class Database:
             )
             return cur.rowcount
 
-    # ---- stats ---------------------------------------------------------
 
-    def stats(self, user_id: int) -> dict:
-        with self._lock:
-            row = self._conn.execute(
-                """SELECT COUNT(*) AS total,
-                          COALESCE(SUM(duration_seconds), 0) AS total_seconds,
-                          MIN(created_at) AS first_at,
-                          MAX(created_at) AS last_at
-                   FROM notes WHERE user_id=?""",
-                (user_id,),
-            ).fetchone()
-            return {
-                "total": row["total"],
-                "total_seconds": float(row["total_seconds"] or 0.0),
-                "first_at": row["first_at"],
-                "last_at": row["last_at"],
-            }
-
-
-    def _to_note(row: sqlite3.Row) -> Note:
-        return Note(
-            note_id=row["note_id"],
-            user_id=row["user_id"],
-            created_at=row["created_at"],
-            duration_seconds=row["duration_seconds"],
-            lang=row["lang"],
-            title=row["title"],
-            transcript=row["transcript"],
-            summary=json.loads(row["summary_json"]),
-            audio_path=row["audio_path"],
-            source=row["source"],
-        )
-
-
-    def _to_reminder(row: sqlite3.Row) -> Reminder:
-        return Reminder(
-            reminder_id=row["reminder_id"],
-            user_id=row["user_id"],
-            created_at=row["created_at"],
-            fire_at=row["fire_at"],
-            advance_minutes=row["advance_minutes"],
-            text=row["text"],
-            source_note_id=row["source_note_id"],
-            status=row["status"],
-            fired_at=row["fired_at"],
-        )
-
-
-    def _sanitize_fts(q: str) -> str:
-        """Элементарная очистка запроса под FTS5: убираем служебные символы, оборачиваем в кавычки."""
-        q = q.strip()
-        if not q:
-            return ""
-        # экранируем двойные кавычки
-        q = q.replace('"', '""')
-        return f'"{q}"'
+def _to_reminder(row: sqlite3.Row) -> Reminder:
+    return Reminder(
+        reminder_id=row["reminder_id"],
+        user_id=row["user_id"],
+        created_at=row["created_at"],
+        fire_at=row["fire_at"],
+        advance_minutes=row["advance_minutes"],
+        text=row["text"],
+        source_note_id=row["source_note_id"],
+        status=row["status"],
+        fired_at=row["fired_at"],
+    )

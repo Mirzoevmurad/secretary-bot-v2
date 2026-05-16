@@ -24,7 +24,7 @@ from telegram.ext import (
 )
 
 from config import Config
-from db import Database, Note, Reminder
+from db import Database, Reminder
 from llm import GroqLLM, LLMError, Summary
 from reminders import (
     materialize_reminders,
@@ -81,7 +81,7 @@ async def _deny(update: Update) -> None:
 def _split_for_telegram(text: str, limit: int = 3900) -> list[str]:
     """Делит длинное HTML-сообщение на куски ≤ limit символов, не ломая HTML-тэги.
 
-    `format_note` использует только теги `<b>` и `<i>`, и они никогда не пересекают
+    Форматирование использует только теги `<b>` и `<i>`, и они никогда не пересекают
     `\\n`. Поэтому любая граница `\\n\\n` / `\\n` безопасна. Сначала пытаемся резать
     по абзацам, потом по строкам, потом по предложениям/словам.
     """
@@ -362,62 +362,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_html(fmt.format_help())
 
 
-async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_allowed(context, update.effective_user.id):
-        await _deny(update)
-        return
-    cfg: Config = context.bot_data["cfg"]
-    db: Database = context.bot_data["db"]
-    note = db.last_note(update.effective_user.id)
-    if note is None:
-        await update.effective_message.reply_text("Заметок пока нет.")
-        return
-    await _reply_long_html(
-        update.effective_message,
-        fmt.format_note(note, tz_name=cfg.tz),
-        reply_markup=kb.note_actions_kb(note.note_id),
-    )
-
-
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_allowed(context, update.effective_user.id):
-        await _deny(update)
-        return
-    limit = 10
-    args = (context.args or [])
-    if args and args[0].isdigit():
-        limit = min(int(args[0]), 50)
-    db: Database = context.bot_data["db"]
-    cfg: Config = context.bot_data["cfg"]
-    notes = db.list_notes(update.effective_user.id, limit=limit)
-    markup = kb.note_list_kb([n.note_id for n in notes]) if notes else None
-    await update.effective_message.reply_html(fmt.format_list(notes, cfg.tz), reply_markup=markup)
-
-
-async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_allowed(context, update.effective_user.id):
-        await _deny(update)
-        return
-    q = " ".join(context.args or []).strip()
-    if not q:
-        await update.effective_message.reply_text("Использование: /search <запрос>")
-        return
-    cfg: Config = context.bot_data["cfg"]
-    db: Database = context.bot_data["db"]
-    notes = db.search(update.effective_user.id, q, limit=10)
-    await update.effective_message.reply_html(fmt.format_search(notes, q, cfg.tz))
-
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_allowed(context, update.effective_user.id):
-        await _deny(update)
-        return
-    cfg: Config = context.bot_data["cfg"]
-    db: Database = context.bot_data["db"]
-    s = db.stats(update.effective_user.id)
-    await update.effective_message.reply_html(fmt.format_stats(s, cfg.tz))
-
-
 async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(context, update.effective_user.id):
         await _deny(update)
@@ -431,15 +375,6 @@ async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     context.bot_data["db"].set_lang(update.effective_user.id, args[0])
     await update.effective_message.reply_text(f"Язык распознавания установлен: {args[0]}")
-
-
-async def cmd_forget_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_allowed(context, update.effective_user.id):
-        await _deny(update)
-        return
-    db: Database = context.bot_data["db"]
-    n = db.delete_all(update.effective_user.id)
-    await update.effective_message.reply_text(f"🗑 Удалено заметок: {n}")
 
 
 async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -482,65 +417,13 @@ async def cmd_export_ical(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
-async def _send_polished(msg, context: ContextTypes.DEFAULT_TYPE, note: Note) -> None:
-    """Полирует транскрипт заметки через LLM и отправляет в чат."""
-    llm: GroqLLM = context.bot_data["llm"]
-    placeholder = await msg.reply_text("📝 Полирую…")
-    try:
-        polished = await llm.polish(note.transcript)
-    except LLMError as e:
-        await placeholder.edit_text(f"⚠️ Не смог полировать: {e}")
-        return
-    except Exception as e:  # noqa: BLE001
-        logger.exception("polish failed")
-        await placeholder.edit_text(f"⚠️ Ошибка полировки ({type(e).__name__}).")
-        return
-    try:
-        await placeholder.delete()
-    except Exception:  # noqa: BLE001
-        pass
-    header = f"<b>📝 Полированный текст #{note.note_id}</b>\n\n"
-    body = fmt.esc(polished)
-    await _reply_long_html(msg, header + body)
-
-
-async def cmd_txt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/txt` — полирует транскрипт последней заметки.
-    `/txt N` — полирует заметку #N.
-    """
-    if not _is_allowed(context, update.effective_user.id):
-        await _deny(update)
-        return
-    db: Database = context.bot_data["db"]
-    args = context.args or []
-    note: Note | None
-    if args and args[0].isdigit():
-        note = db.get_note(int(args[0]), update.effective_user.id)
-        if note is None:
-            await update.effective_message.reply_text(f"Заметка #{args[0]} не найдена.")
-            return
-    else:
-        note = db.last_note(update.effective_user.id)
-        if note is None:
-            await update.effective_message.reply_text(
-                "Заметок пока нет — пришлите голосовое или текст."
-            )
-            return
-    await _send_polished(update.effective_message, context, note)
-
-
-# --- /get_N и /delete_N как динамические команды -----------------------
-
-
-_GET_RE = re.compile(r"^/get_(\d+)(?:@\w+)?$")
-_DELETE_RE = re.compile(r"^/delete_(\d+)(?:@\w+)?$")
 _CANCEL_RE = re.compile(r"^/cancel_(\d+)(?:@\w+)?$")
 
-MIN_TEXT_NOTE_LEN = 3
+MIN_TEXT_LEN = 3
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает любые текстовые сообщения, включая динамические команды /get_/delete_/cancel_.
+    """Обрабатывает любые текстовые сообщения, включая динамические команды /cancel_.
 
     Если это плоский текст без команд — обрабатываем как заметку (тот же пайплайн, что у голоса,
     только без STT).
@@ -571,27 +454,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if context.user_data is not None:
             context.user_data.pop("pending_edit", None)
 
-    m = _GET_RE.match(txt)
-    if m:
-        note_id = int(m.group(1))
-        note = db.get_note(note_id, update.effective_user.id)
-        if note is None:
-            await update.effective_message.reply_text(f"Заметка #{note_id} не найдена.")
-            return
-        await _reply_long_html(
-            update.effective_message,
-            fmt.format_transcript(note),
-            reply_markup=kb.note_actions_kb(note.note_id),
-        )
-        return
-    m = _DELETE_RE.match(txt)
-    if m:
-        note_id = int(m.group(1))
-        ok = db.delete_note(note_id, update.effective_user.id)
-        await update.effective_message.reply_text(
-            f"🗑 Заметка #{note_id} удалена." if ok else f"Заметка #{note_id} не найдена."
-        )
-        return
     m = _CANCEL_RE.match(txt)
     if m:
         rid = int(m.group(1))
@@ -611,7 +473,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # плоский текст → пропускаем через тот же пайплайн, что и голос (но без STT)
-    if len(txt) < MIN_TEXT_NOTE_LEN:
+    if len(txt) < MIN_TEXT_LEN:
         await update.effective_message.reply_text(
             "Текст слишком короткий. Пришлите хотя бы пару предложений или голосовое 🎤."
         )
@@ -645,9 +507,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 _FIELD_PROMPTS = {
-    "title": "Пришлите новый заголовок для заметки",
-    "cat": "Пришлите новую категорию (например: Работа, Личное, Идея, Покупки)",
-    "tags": "Пришлите теги через пробел или запятую (например: проект, дедлайн)",
     "rtext": "Пришлите новый текст напоминания",
     "rtime": (
         "Пришлите новое время напоминания. Можно:\n"
@@ -663,20 +522,7 @@ def _current_value_for_edit(
     """Возвращает текущее значение редактируемого поля, чтобы показать его
     в prompt'е (и кнопке «📋 Скопировать текущее»). None — если получить не
     получилось (объект не найден или поле пустое)."""
-    if kind == "note":
-        note = db.get_note(item_id, user_id)
-        if note is None:
-            return None
-        if field == "title":
-            return note.title or None
-        if field == "cat":
-            return (note.summary.get("category") or "").strip() or None
-        if field == "tags":
-            tags = note.summary.get("tags") or []
-            if isinstance(tags, list):
-                return ", ".join(str(t) for t in tags) or None
-            return str(tags) or None
-    elif kind == "rem":
+    if kind == "rem":
         rem = db.get_reminder(item_id, user_id)
         if rem is None:
             return None
@@ -744,7 +590,7 @@ async def _apply_pending_edit(
     pending: dict,
     new_value: str,
 ) -> None:
-    """Применяет pending edit (заметка/напоминание × поле). Снимает pending в любом случае."""
+    """Применяет pending edit (напоминание / перевод × поле). Снимает pending в любом случае."""
     db: Database = context.bot_data["db"]
     cfg: Config = context.bot_data["cfg"]
     user_id = update.effective_user.id
@@ -756,27 +602,6 @@ async def _apply_pending_edit(
 
     if not new_value:
         await update.effective_message.reply_text("Пустое значение, отмена.")
-        return
-
-    if kind == "note":
-        if field == "title":
-            ok = db.update_note_title(item_id, user_id, new_value[:200])
-            await update.effective_message.reply_text(
-                f"✅ Заголовок заметки #{item_id} обновлён." if ok else f"Заметка #{item_id} не найдена."
-            )
-        elif field == "cat":
-            ok = db.update_note_summary_field(item_id, user_id, "category", new_value[:50])
-            await update.effective_message.reply_text(
-                f"✅ Категория заметки #{item_id} обновлена." if ok else f"Заметка #{item_id} не найдена."
-            )
-        elif field == "tags":
-            tags = [t.strip() for t in re.split(r"[,\s]+", new_value) if t.strip()][:20]
-            ok = db.update_note_summary_field(item_id, user_id, "tags", tags)
-            await update.effective_message.reply_text(
-                f"✅ Теги заметки #{item_id}: {', '.join(tags) or '—'}" if ok else f"Заметка #{item_id} не найдена."
-            )
-        else:
-            await update.effective_message.reply_text("Неизвестное поле.")
         return
 
     if kind == "xlate":
@@ -919,99 +744,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if len(parts) < 2:
         await q.answer("Неизвестное действие.")
         return
-    # n:e:title:42 / n:e:cat:42 / n:e:tags:42
-    if parts[0] == "n" and parts[1] == "e" and len(parts) == 4:
-        await q.answer()
-        await _ask_for_edit(context, q.message.chat_id, "note", int(parts[3]), parts[2], user_id=user_id)
-        return
-    # n:open:42
-    if parts[0] == "n" and parts[1] == "open" and len(parts) == 3:
-        note_id = int(parts[2])
-        note = db.get_note(note_id, user_id)
-        if note is None:
-            await q.answer("Заметка не найдена.", show_alert=True)
-            return
-        await q.answer()
-        await _reply_long_html(
-            q.message,
-            fmt.format_note(note, tz_name=cfg.tz),
-            reply_markup=kb.note_actions_kb(note.note_id),
-        )
-        return
-    # n:del:42 → подтверждение
-    if parts[0] == "n" and parts[1] == "del" and len(parts) == 3:
-        await q.answer()
-        await context.bot.send_message(
-            chat_id=q.message.chat_id,
-            text=f"🗑 Удалить заметку #{parts[2]}?",
-            reply_markup=kb.confirm_delete_note_kb(int(parts[2])),
-        )
-        return
-    # n:polish:42 — полировка транскрипта LLM (заменяет заметку полированным текстом)
-    if parts[0] == "n" and parts[1] == "polish" and len(parts) == 3:
-        note_id = int(parts[2])
-        note = db.get_note(note_id, user_id)
-        if note is None:
-            await q.answer("Заметка не найдена.", show_alert=True)
-            return
-        await q.answer("Полирую…")
-        llm: GroqLLM = context.bot_data["llm"]
-        try:
-            polished = await llm.polish(note.transcript)
-        except LLMError as e:
-            await q.message.reply_text(f"⚠️ Не смог полировать: {e}")
-            return
-        except Exception as e:  # noqa: BLE001
-            logger.exception("polish failed")
-            await q.message.reply_text(f"⚠️ Ошибка полировки ({type(e).__name__}).")
-            return
-        # сначала доставляем полированный текст, и только при успехе удаляем заметку из БД,
-        # чтобы при сбое отправки данные не пропали.
-        header = "<b>📝 Полированный текст</b>\n\n"
-        body = fmt.esc(polished)
-        text = header + body
-        delivered = False
-        try:
-            if len(text) <= 3900:
-                await q.edit_message_text(
-                    text, parse_mode=ParseMode.HTML, disable_web_page_preview=True
-                )
-                delivered = True
-            else:
-                # длинный текст не влезает в одно сообщение → удаляем оригинал и шлём новый(е)
-                try:
-                    await q.message.delete()
-                except Exception:  # noqa: BLE001
-                    pass
-                await _reply_long_html(q.message, text)
-                delivered = True
-        except Exception:  # noqa: BLE001
-            # edit может упасть, если сообщение слишком старое или содержит документ —
-            # тогда удалим оригинал и пришлём новое.
-            try:
-                await q.message.delete()
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                await _reply_long_html(q.message, text)
-                delivered = True
-            except Exception:  # noqa: BLE001
-                logger.exception("failed to deliver polished text; keeping note in DB")
-        if delivered:
-            db.delete_note(note_id, user_id)
-        return
-    # n:del_yes:42
-    if parts[0] == "n" and parts[1] == "del_yes" and len(parts) == 3:
-        note_id = int(parts[2])
-        ok = db.delete_note(note_id, user_id)
-        await q.answer("Удалено." if ok else "Не найдено.")
-        try:
-            await q.edit_message_text(
-                f"🗑 Заметка #{note_id} удалена." if ok else f"Заметка #{note_id} не найдена.",
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        return
     # r:e:time:5 / r:e:text:5
     if parts[0] == "r" and parts[1] == "e" and len(parts) == 4:
         await q.answer()
@@ -1125,94 +857,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             reply_markup=kb.translate_actions_kb(
                 token, source_text=src, translated_text=translated,
             ),
-        )
-        return
-    # x:save:<token> — сохранить полированный текст как заметку
-    # (с структурированием: тэги, категория, задачи, саммари).
-    if parts[0] == "x" and parts[1] == "save" and len(parts) == 3:
-        token = parts[2]
-        entry = _xlate_cache_get(context).get(token)
-        if entry is None or entry.get("user_id") != user_id:
-            await q.answer("Текст не найден (бот мог быть перезапущен).", show_alert=True)
-            return
-        src = (entry.get("src") or "").strip()
-        if not src:
-            await q.answer("Пустой текст.", show_alert=True)
-            return
-        await q.answer("Сохраняю в заметки…")
-        # Убираем кнопку «📝 В заметки» с исходного сообщения сразу — чтобы
-        # повторные клики (например пока идёт LLM) не создали дубль.
-        # Оставляем «📋 Скопировать» и «🌍 Перевести» (show_save=False).
-        try:
-            await q.edit_message_reply_markup(
-                reply_markup=kb.polish_actions_kb(token, src, show_save=False),
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        llm: GroqLLM = context.bot_data["llm"]
-        try:
-            summary: Summary = await llm.structure(
-                src, now_context=now_context_block(cfg.tz),
-            )
-        except LLMError as e:
-            await q.message.reply_text(f"⚠️ Не смог структурировать: {e}")
-            return
-        except Exception as e:  # noqa: BLE001
-            logger.exception("save-as-note structure failed")
-            await q.message.reply_text(
-                f"⚠️ Ошибка структурирования ({type(e).__name__})."
-            )
-            return
-        note_id = db.add_note(
-            user_id=user_id,
-            transcript=src,
-            summary=summary.model_dump(),
-            title=summary.title,
-            lang=None,
-            duration_seconds=None,
-            audio_path=None,
-            source="manual_save",
-        )
-        note = db.get_note(note_id, user_id)
-        # Планируем напоминания, если LLM их выделил.
-        scheduled = materialize_reminders(
-            db, user_id, summary.reminders, cfg.tz,
-            cfg.default_advance_minutes, source_note_id=note_id,
-        )
-        for r in scheduled:
-            _schedule_reminder(context.application, r)
-        # Защита: get_note возвращает Optional. add_note только что вернул id,
-        # так что здесь None — крайне маловероятный кейс (рейс/удаление между
-        # двумя запросами). Защищаемся, чтобы не упасть с AttributeError.
-        if note is None:
-            await q.message.reply_text(
-                f"✅ Заметка #{note_id} сохранена. /get_{note_id} — посмотреть."
-            )
-            return
-        # Показываем полный конспект.
-        await _reply_long_html(
-            q.message,
-            fmt.format_note(note, tz_name=cfg.tz),
-            reply_markup=kb.note_actions_kb(note.note_id),
-        )
-        for r in scheduled:
-            advance_part = (
-                f" (с уведомлением за {r.advance_minutes} мин)"
-                if r.advance_minutes > 0 else ""
-            )
-            await context.bot.send_message(
-                chat_id=q.message.chat_id,
-                text=(
-                    f"✅ Напоминание #{r.reminder_id} создано.\n"
-                    f"⏰ <b>{fmt.fmt_fire_at(r.fire_at, cfg.tz)}</b>{advance_part}\n"
-                    f"📝 {fmt.esc(r.text)}"
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb.reminder_actions_kb(r.reminder_id),
-            )
-        logger.info(
-            "manual save-as-note for user %d: note_id=%d, reminders=%d",
-            user_id, note_id, len(scheduled),
         )
         return
     # r:cancel_yes:5
@@ -1330,7 +974,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         source="voice" if msg.voice else "audio",
         audio_path_saved=audio_path_saved,
     )
-    logger.info("note for user %d: %.1fs audio, STT %.1fs", user.id, duration, stt_seconds)
+    logger.info("voice for user %d: %.1fs audio, STT %.1fs", user.id, duration, stt_seconds)
 
 
 # ---- shared LLM + save + reminders pipeline ----------------------------
@@ -1412,40 +1056,6 @@ async def _process_summary(
         )
         return
 
-    # Решение разделено на ДВА флага.
-    #   save_to_db — пишем заметку в БД (нужно если есть напоминания, чистый
-    #     reminder-only кейс, ИЛИ автор явно хотел сохранить).
-    #   show_full_summary — показываем структурированный конспект (только когда
-    #     автор явно хотел заметку: should_save_note=true). Если есть напоминание
-    #     БЕЗ should_save_note и БЕЗ is_reminder_only — заметка сохранится в БД
-    #     для контекста, но в чате будет полированный текст + кнопки напоминания
-    #     (а не развёрнутый конспект).
-    save_to_db = bool(
-        summary.should_save_note or summary.is_reminder_only or summary.reminders
-    )
-    show_full_summary = bool(summary.should_save_note)
-    note_id: int | None = None
-    note: Note | None = None
-    if save_to_db:
-        note_id = db.add_note(
-            user_id=user.id,
-            transcript=transcript,
-            summary=summary.model_dump(),
-            title=summary.title,
-            lang=lang,
-            duration_seconds=duration,
-            audio_path=audio_path_saved,
-            source=source,
-        )
-        note = db.get_note(note_id, user.id)
-        if note is None:
-            logger.error("note #%s vanished right after insert", note_id)
-            try:
-                await placeholder.edit_text("⚠️ Внутренняя ошибка: не удалось получить сохранённую заметку.")
-            except Exception:
-                pass
-            return
-
     # materialize + schedule reminders
     scheduled = materialize_reminders(
         db,
@@ -1453,15 +1063,13 @@ async def _process_summary(
         summary.reminders,
         cfg.tz,
         cfg.default_advance_minutes,
-        source_note_id=note_id,
+        source_note_id=None,
     )
     for r in scheduled:
         _schedule_reminder(context.application, r)
 
     # Reminder-only режим: пользователь сказал «напомни в X встретиться с Y» —
-    # развёрнутое саммари не нужно, шлём только короткое подтверждение
-    # с inline-кнопками. Заметка всё равно сохраняется в БД (доступна через /list,
-    # /search, /get_N) — просто не выводим её визуально.
+    # шлём только короткое подтверждение с inline-кнопками.
     if summary.is_reminder_only and scheduled:
         await placeholder.delete()
         for r in scheduled:
@@ -1480,74 +1088,24 @@ async def _process_summary(
                 reply_markup=kb.reminder_actions_kb(r.reminder_id),
             )
         logger.info(
-            "reminder-only note #%d for user %d: source=%s, reminders=%d",
-            note_id, user.id, source, len(scheduled),
+            "reminder-only for user %d: source=%s, reminders=%d",
+            user.id, source, len(scheduled),
         )
         return
 
-    # Ветка А — заметку сохраняем и показываем структурированный вид.
-    if show_full_summary and note is not None:
-        text = fmt.format_note(note, tz_name=cfg.tz, scheduled_reminders=scheduled)
-        chunks = _split_for_telegram(text, limit=3900)
-        safe = not _has_unsafe_chunk(chunks, 3900)
-        note_kb = kb.note_actions_kb(note.note_id)
-        if safe:
-            await placeholder.edit_text(
-                chunks[0], parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-                reply_markup=note_kb if len(chunks) == 1 else None,
-            )
-            for i, chunk in enumerate(chunks[1:], start=1):
-                kw = {"parse_mode": ParseMode.HTML, "disable_web_page_preview": True}
-                if i == len(chunks) - 1:
-                    kw["reply_markup"] = note_kb
-                await context.bot.send_message(chat_id=msg.chat_id, text=chunk, **kw)
-        else:
-            pieces = [text[i:i + 3900] for i in range(0, len(text), 3900)]
-            await placeholder.edit_text(
-                pieces[0], parse_mode=None, disable_web_page_preview=True,
-                reply_markup=note_kb if len(pieces) == 1 else None,
-            )
-            for i, piece in enumerate(pieces[1:], start=1):
-                kw = {"parse_mode": None, "disable_web_page_preview": True}
-                if i == len(pieces) - 1:
-                    kw["reply_markup"] = note_kb
-                await context.bot.send_message(chat_id=msg.chat_id, text=piece, **kw)
-        for r in scheduled:
-            await context.bot.send_message(
-                chat_id=msg.chat_id,
-                text=f"⏰ Напоминание #{r.reminder_id}: {fmt.esc(r.text)}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb.reminder_actions_kb(r.reminder_id),
-            )
-        logger.info(
-            "note #%d for user %d: source=%s, reminders=%d",
-            note_id, user.id, source, len(scheduled),
-        )
-        return
-
-    # Ветка Б — заметку как конспект не показываем. Возвращаем отполированный
-    # текст: header в одном сообщении, тело — в отдельном (чтобы long-press
-    # копировал ТОЛЬКО body без заголовка), плюс кнопка [📋 Скопировать]
-    # (CopyTextButton — single tap, если умещается в 256 символов) и
-    # [🌍 Перевести] (RU↔EN). Если есть напоминания, добавляем для каждого
-    # отдельное сообщение с кнопками управления (как в ветке А).
+    # Полируем текст и возвращаем с кнопками копирования / перевода.
     try:
         polished = await llm.polish(transcript)
     except Exception as e:  # noqa: BLE001
         logger.warning("polish fallback to raw: %s", e)
         polished = transcript
     token = _xlate_cache_put(context, user_id=user.id, source_text=polished)
-    # Если заметка уже сохранена в БД (для контекста, потому что есть напоминание
-    # без явного «запиши»), кнопку «📝 В заметки» прятать — повторный клик
-    # создал бы дубль. Иначе показываем — даём пользователю явный путь сохранить.
     await _send_body_with_actions(
         msg, context,
         placeholder=placeholder,
         header="<b>📝 Полированный текст</b>",
         body=fmt.esc(polished),
-        reply_markup=kb.polish_actions_kb(
-            token, polished, show_save=not save_to_db,
-        ),
+        reply_markup=kb.polish_actions_kb(token, polished),
     )
     for r in scheduled:
         advance_part = (
@@ -1565,8 +1123,8 @@ async def _process_summary(
             reply_markup=kb.reminder_actions_kb(r.reminder_id),
         )
     logger.info(
-        "polish response for user %d: source=%s, reminders=%d, saved_for_context=%s",
-        user.id, source, len(scheduled), save_to_db,
+        "polish response for user %d: source=%s, reminders=%d",
+        user.id, source, len(scheduled),
     )
 
 
@@ -1616,7 +1174,7 @@ async def _process_grok_chat(
         placeholder=placeholder,
         header="<b>🤖 Грок отвечает</b>",
         body=fmt.esc(answer),
-        reply_markup=kb.polish_actions_kb(token, answer, show_save=False),
+        reply_markup=kb.polish_actions_kb(token, answer),
     )
     logger.info(
         "grok chat for user %d: source=%s, q_len=%d, a_len=%d",
@@ -1854,20 +1412,14 @@ def build_app() -> Application:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("last", cmd_last))
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("search", cmd_search))
-    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("lang", cmd_lang))
-    app.add_handler(CommandHandler("forget_all", cmd_forget_all))
     app.add_handler(CommandHandler("reminders", cmd_reminders))
     app.add_handler(CommandHandler("export_ical", cmd_export_ical))
-    app.add_handler(CommandHandler("txt", cmd_txt))
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    # подхватываем динамические /get_N, /delete_N — telegram считает их командами
+    # подхватываем динамические /cancel_N — telegram считает их командами
     app.add_handler(MessageHandler(filters.COMMAND, on_text))
 
     app.add_error_handler(_error)
@@ -1878,15 +1430,9 @@ def build_app() -> Application:
 BOT_COMMANDS: list[tuple[str, str]] = [
     ("start", "🚀 Приветствие и краткая справка"),
     ("help", "❓ Полный список команд"),
-    ("last", "📄 Последняя заметка"),
-    ("list", "📚 Список последних заметок"),
-    ("search", "🔍 Поиск по заметкам"),
-    ("txt", "📝 Полировать последнее голосовое"),
     ("reminders", "⏰ Активные напоминания"),
     ("export_ical", "📅 Экспорт напоминаний в .ics"),
-    ("stats", "📊 Статистика"),
     ("lang", "🌐 Язык распознавания (ru/en/auto)"),
-    ("forget_all", "🗑 Удалить все заметки"),
 ]
 
 
