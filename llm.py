@@ -6,7 +6,7 @@ import json
 import logging
 from typing import Any
 
-from groq import Groq
+from groq import AsyncGroq
 from pydantic import BaseModel, Field, ValidationError
 
 
@@ -171,23 +171,32 @@ class LLMError(Exception):
 
 class GroqLLM:
     def __init__(self, api_key: str, model: str = "llama-3.3-70b-versatile") -> None:
-        self._client = Groq(api_key=api_key)
+        self._client = AsyncGroq(api_key=api_key)
         self._model = model
 
     async def polish(self, transcript: str) -> str:
         """Полирует транскрипт по правилам POLISH_SYSTEM_PROMPT."""
         if not transcript.strip():
             raise LLMError("Пустой транскрипт")
-        return await asyncio.to_thread(self._polish_sync, transcript)
+        completion = await self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": POLISH_SYSTEM_PROMPT},
+                {"role": "user", "content": transcript},
+            ],
+            temperature=0.3,
+            max_tokens=4000,
+        )
+        text = (completion.choices[0].message.content or "").strip()
+        if not text:
+            raise LLMError("LLM вернул пустой результат")
+        return text
 
     async def chat(self, question: str) -> str:
         """Свободный ИИ-ответ на вопрос (режим «Грок»)."""
         if not question.strip():
             raise LLMError("Пустой вопрос")
-        return await asyncio.to_thread(self._chat_sync, question)
-
-    def _chat_sync(self, question: str) -> str:
-        completion = self._client.chat.completions.create(
+        completion = await self._client.chat.completions.create(
             model=self._model,
             messages=[
                 {"role": "system", "content": CHAT_SYSTEM_PROMPT},
@@ -207,14 +216,11 @@ class GroqLLM:
             raise LLMError("Пустой текст для перевода")
         if not target_lang.strip():
             raise LLMError("Не указан целевой язык")
-        return await asyncio.to_thread(self._translate_sync, text, target_lang)
-
-    def _translate_sync(self, text: str, target_lang: str) -> str:
         prompt = TRANSLATE_SYSTEM_PROMPT_TEMPLATE.format(
             target_lang_human=lang_human_name(target_lang),
             target_lang_code=target_lang,
         )
-        completion = self._client.chat.completions.create(
+        completion = await self._client.chat.completions.create(
             model=self._model,
             messages=[
                 {"role": "system", "content": prompt},
@@ -228,33 +234,15 @@ class GroqLLM:
             raise LLMError("LLM вернул пустой результат перевода")
         return out
 
-    def _polish_sync(self, transcript: str) -> str:
-        completion = self._client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": POLISH_SYSTEM_PROMPT},
-                {"role": "user", "content": transcript},
-            ],
-            temperature=0.3,
-            max_tokens=4000,
-        )
-        text = (completion.choices[0].message.content or "").strip()
-        if not text:
-            raise LLMError("LLM вернул пустой результат")
-        return text
-
     async def structure(self, transcript: str, *, now_context: str | None = None) -> Summary:
         """Структурирует текст. now_context — пред-блок с текущим временем и таймзоной автора,
         нужен LLM для парсинга относительных дат («завтра в 12:30»)."""
         if not transcript.strip():
             raise LLMError("Пустой транскрипт")
-        return await asyncio.to_thread(self._structure_sync, transcript, now_context)
-
-    def _structure_sync(self, transcript: str, now_context: str | None) -> Summary:
         user_content = transcript
         if now_context:
             user_content = f"[Контекст]\n{now_context}\n\n[Транскрипт]\n{transcript}"
-        completion = self._client.chat.completions.create(
+        completion = await self._client.chat.completions.create(
             model=self._model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},

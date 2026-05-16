@@ -5,9 +5,9 @@ import asyncio
 import logging
 import re
 import secrets as _secrets
-import subprocess
 import tempfile
 import time
+from collections import defaultdict
 from pathlib import Path
 
 from telegram import BotCommand, Update
@@ -46,6 +46,22 @@ except Exception:  # noqa: BLE001
 
 
 logger = logging.getLogger("secretary")
+
+class RateLimiter:
+    def __init__(self, max_requests: int = 10, window_seconds: int = 60) -> None:
+        self._requests: dict[int, list[float]] = defaultdict(list)
+        self._max = max_requests
+        self._window = window_seconds
+
+    def is_allowed(self, user_id: int) -> bool:
+        now = time.time()
+        self._requests[user_id] = [
+            t for t in self._requests[user_id] if now - t < self._window
+        ]
+        if len(self._requests[user_id]) >= self._max:
+            return False
+        self._requests[user_id].append(now)
+        return True
 
 
 # ---- helpers -----------------------------------------------------------
@@ -313,15 +329,17 @@ async def _send_body_with_actions(
             )
 
 
-def _convert_to_wav(src: Path, dst: Path) -> None:
+async def _convert_to_wav(src: Path, dst: Path) -> None:
     """OGG/Opus → 16kHz mono WAV. Whisper в Groq API также принимает исходный ogg,
     но конвертация уменьшает размер и нормализует."""
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(src), "-ac", "1", "-ar", "16000", str(dst)],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", str(src), "-ac", "1", "-ar", "16000", str(dst),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
     )
+    returncode = await proc.wait()
+    if returncode != 0:
+        raise RuntimeError(f"ffmpeg exited with code {returncode}")
 
 
 # ---- command handlers --------------------------------------------------
@@ -600,6 +618,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     user = update.effective_user
+    
+    rl: RateLimiter = context.bot_data["rate_limiter"]
+    if not rl.is_allowed(user.id):
+        await update.effective_message.reply_text("⏳ Слишком много запросов. Подождите около минуты.")
+        return
+
     db.upsert_user(user.id, user.username, user.first_name, user.last_name)
     placeholder = await update.effective_message.reply_text(fmt.format_processing_text())
     await context.bot.send_chat_action(
@@ -1223,6 +1247,11 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     stt: GroqSTT = context.bot_data["stt"]
     llm: GroqLLM = context.bot_data["llm"]
 
+    rl: RateLimiter = context.bot_data["rate_limiter"]
+    if not rl.is_allowed(user.id):
+        await update.effective_message.reply_text("⏳ Слишком много запросов. Подождите около минуты.")
+        return
+
     db.upsert_user(user.id, user.username, user.first_name, user.last_name)
 
     msg = update.effective_message
@@ -1248,7 +1277,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         wav = tmp_path / "audio.wav"
         await tg_file.download_to_drive(src)
         try:
-            _convert_to_wav(src, wav)
+            await _convert_to_wav(src, wav)
             upload_path = wav
         except Exception as e:
             logger.warning("ffmpeg failed: %s; uploading source file as-is", e)
@@ -1409,7 +1438,13 @@ async def _process_summary(
             source=source,
         )
         note = db.get_note(note_id, user.id)
-        assert note is not None
+        if note is None:
+            logger.error("note #%s vanished right after insert", note_id)
+            try:
+                await placeholder.edit_text("⚠️ Внутренняя ошибка: не удалось получить сохранённую заметку.")
+            except Exception:
+                pass
+            return
 
     # materialize + schedule reminders
     scheduled = materialize_reminders(
@@ -1815,6 +1850,7 @@ def build_app() -> Application:
     app.bot_data["db"] = db
     app.bot_data["stt"] = stt
     app.bot_data["llm"] = llm
+    app.bot_data["rate_limiter"] = RateLimiter(max_requests=10, window_seconds=60)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
