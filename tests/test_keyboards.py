@@ -1,8 +1,5 @@
 from keyboards import (
     confirm_cancel_reminder_kb,
-    confirm_delete_note_kb,
-    note_actions_kb,
-    note_list_kb,
     polish_actions_kb,
     reminder_actions_kb,
     reminders_list_kb,
@@ -19,20 +16,6 @@ def _all_buttons(markup) -> list:
     return [b for row in markup.inline_keyboard for b in row]
 
 
-def test_note_actions_kb_callbacks():
-    pairs = _flatten(note_actions_kb(42))
-    cb = {c for _, c in pairs}
-    assert "n:e:title:42" in cb
-    assert "n:e:cat:42" in cb
-    assert "n:e:tags:42" in cb
-    assert "n:del:42" in cb
-
-
-def test_confirm_delete_note_kb():
-    cb = {c for _, c in _flatten(confirm_delete_note_kb(7))}
-    assert cb == {"n:del_yes:7", "nop"}
-
-
 def test_reminder_actions_kb():
     cb = {c for _, c in _flatten(reminder_actions_kb(11))}
     assert cb == {"r:e:time:11", "r:e:text:11", "r:cancel:11"}
@@ -47,11 +30,6 @@ def test_reminders_list_kb_compact():
     assert "r:e:time:2" in cb
 
 
-def test_note_list_kb_open():
-    cb = {c for _, c in _flatten(note_list_kb([5, 6, 7]))}
-    assert cb == {"n:open:5", "n:open:6", "n:open:7"}
-
-
 def test_confirm_cancel_reminder_kb():
     cb = {c for _, c in _flatten(confirm_cancel_reminder_kb(33))}
     assert cb == {"r:cancel_yes:33", "nop"}
@@ -61,17 +39,14 @@ def test_polish_actions_kb_short_text_has_copy_button():
     """При коротком тексте (≤256 байт) есть CopyTextButton (single-tap copy)."""
     kb_obj = polish_actions_kb("abcd1234", "короткий полированный текст")
     buttons = _all_buttons(kb_obj)
-    # должна быть кнопка с copy_text (CopyTextButton) и кнопка callback_data
     has_copy = any(getattr(b, "copy_text", None) is not None for b in buttons)
     has_translate_cb = any(b.callback_data == "x:tr:abcd1234" for b in buttons)
-    has_save_cb = any(b.callback_data == "x:save:abcd1234" for b in buttons)
     assert has_copy
     assert has_translate_cb
-    assert has_save_cb
 
 
 def test_polish_actions_kb_long_text_skips_copy_button():
-    """При длинном тексте (>256 символов) CopyTextButton не строится — но Перевести и В заметки остаются."""
+    """При длинном тексте (>256 символов) CopyTextButton не строится — но Перевести остаётся."""
     long_text = "x" * 300
     kb_obj = polish_actions_kb("tok", long_text)
     buttons = _all_buttons(kb_obj)
@@ -79,15 +54,6 @@ def test_polish_actions_kb_long_text_skips_copy_button():
     assert not has_copy
     cb = {b.callback_data for b in buttons if b.callback_data}
     assert "x:tr:tok" in cb
-    assert "x:save:tok" in cb
-
-
-def test_polish_actions_kb_show_save_false_hides_save_button():
-    """show_save=False (Грок-режим) — кнопки «В заметки» нет."""
-    kb_obj = polish_actions_kb("tok", "короткий ответ", show_save=False)
-    cb = {b.callback_data for b in _all_buttons(kb_obj) if b.callback_data}
-    assert "x:tr:tok" in cb
-    assert "x:save:tok" not in cb
 
 
 def test_translate_actions_kb_callbacks():
